@@ -74,6 +74,7 @@ DEFAULT_SETTINGS = {
     "paper_cancel_if_gap_gone_ticks": 0.6,
     "paper_min_passive_viability": 65,
     "paper_min_trap_survivability": 65,
+    "paper_max_open_cycles": 1,
 }
 
 
@@ -316,6 +317,9 @@ class LUCWindow(QMainWindow):
         self.paper_recycle_count = 0
         self.paper_trap_close_count = 0
         self.paper_passive_gate = 0
+        self.paper_cycle_source = "NONE"
+        self.paper_max_open_cycles = max(1, int(self.settings.get("paper_max_open_cycles", 1)))
+        self._last_warn_log: dict[str, float] = {}
 
         self.setup_logger()
         self.build_ui()
@@ -365,6 +369,8 @@ class LUCWindow(QMainWindow):
         layout.addLayout(top)
 
         grid = QGridLayout()
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(8)
         self.market_labels = self.make_panel(grid, 0, 0, "Market", [
             "EUR bid", "EUR ask", "EUR mid", "EURI bid", "EURI ask", "EURI mid", "EURI spread",
             "spread ticks", "EUR dir", "EURI dir", "parent vol ticks", "child stale sec",
@@ -399,12 +405,20 @@ class LUCWindow(QMainWindow):
         layout.addWidget(self.log_box, 1)
 
         self.ledger_labels = self.make_panel(grid, 3, 1, "Ledger Last Events", [
-            "event 1", "event 2", "event 3", "event 4", "event 5",
+            "event 1", "event 2", "event 3", "event 4", "event 5", "event 6", "event 7", "event 8",
         ])
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+        grid.setRowStretch(0, 2)
+        grid.setRowStretch(1, 3)
+        grid.setRowStretch(2, 2)
+        grid.setRowStretch(3, 2)
 
     def make_panel(self, grid: QGridLayout, row: int, col: int, title: str, fields: list[str]) -> dict[str, QLabel]:
         box = QGroupBox(title)
         form = QFormLayout(box)
+        form.setVerticalSpacing(3)
+        box.setMinimumHeight(170 if row in (0, 1) else 140)
         labels: dict[str, QLabel] = {}
         for name in fields:
             val = QLabel("-")
@@ -636,6 +650,12 @@ class LUCWindow(QMainWindow):
             self._paper_last_log[key] = now
             self.log(message)
 
+    def _warn_once(self, key: str, message: str, cooldown_sec: float = 12.0) -> None:
+        now = time.time()
+        if now - self._last_warn_log.get(key, 0.0) >= cooldown_sec:
+            self._last_warn_log[key] = now
+            self.log(message)
+
     def _inventory_metrics(self, mark_price: float) -> tuple[float, float, float, float]:
         total_value = self.paper_usdt + self.paper_euri * mark_price
         skew = 0.0 if total_value <= 0 else ((self.paper_euri * mark_price) - self.paper_usdt) / total_value * 100
@@ -652,9 +672,15 @@ class LUCWindow(QMainWindow):
         })
 
     def _open_lot(self, *, side: str, qty: float, price: float, now_ts: float, source: str) -> None:
+        if len(self.paper_lots) >= self.paper_max_open_cycles or self.paper_state != PaperPositionState.FLAT:
+            self._warn_once("open_lot_blocked", "[WARN] open_lot blocked: active cycle or max_open_cycles reached")
+            return
         self.paper_lots.append({"side": side, "qty": qty, "entry_price": price, "entry_time": now_ts, "source": source, "state": "OPEN"})
         self._ledger_add("OPEN_LOT", side, qty, price, 0.0, now_ts)
-        self.log(f"[LEDGER] {side} lot opened qty={qty:.2f} @{price:.4f}")
+        self._paper_log(f"ledger_open_{side}", f"[LEDGER] {side} lot opened qty={qty:.2f} @{price:.4f}", cooldown_sec=8.0)
+
+    def _can_open_new_cycle(self) -> bool:
+        return self.paper_state == PaperPositionState.FLAT and len(self.paper_lots) < self.paper_max_open_cycles
 
     def _close_lots(self, *, side: str, qty: float, price: float, now_ts: float, event_type: str) -> float:
         remain = qty
@@ -712,6 +738,7 @@ class LUCWindow(QMainWindow):
             self.paper_state = PaperPositionState.FLAT
             self.paper_cycle_state = CycleState.CLOSED
             self.paper_cycle_side = "NONE"
+            self.paper_cycle_source = "NONE"
             self.paper_trapped_euri = 0.0
             self._paper_log("recycle", f"[PAPER] recycle completed {ticks:+.2f} tick")
             self._paper_log("close", f"[PAPER] cycle closed pnl={pnl:+.4f}")
@@ -736,6 +763,7 @@ class LUCWindow(QMainWindow):
             self.paper_state = PaperPositionState.FLAT
             self.paper_cycle_state = CycleState.CLOSED
             self.paper_cycle_side = "NONE"
+            self.paper_cycle_source = "NONE"
             self.paper_trapped_euri = 0.0
             self._paper_log("recycle", f"[PAPER] recycle completed {ticks:+.2f} tick")
             self._paper_log("close", f"[PAPER] cycle closed pnl={pnl:+.4f}")
@@ -762,8 +790,12 @@ class LUCWindow(QMainWindow):
             if self.paper_trapped_euri <= 0.1:
                 self.paper_state = PaperPositionState.FLAT
                 self.paper_cycle_state = CycleState.CLOSED
+                self.paper_cycle_source = "NONE"
 
         if self.paper_state != PaperPositionState.FLAT:
+            return
+        if len(self.paper_lots) >= self.paper_max_open_cycles:
+            self._warn_once("max_cycles", "[WARN] max_open_cycles reached")
             return
         if regime in {Regime.DANGEROUS, Regime.ESCAPE, Regime.CAUTION} or abs(skew) >= critical_skew:
             return
@@ -775,7 +807,7 @@ class LUCWindow(QMainWindow):
         min_trap = int(self.settings.get("paper_min_trap_survivability", 65))
 
         if regime == Regime.IDEAL_PASSIVE and passive_viability >= min_passive and abs(skew) < danger_skew:
-            if self.paper_usdt >= qty * self.child_bid:
+            if self.paper_usdt >= qty * self.child_bid and self._can_open_new_cycle():
                 self.paper_entry_price = self.child_bid
                 self.paper_usdt -= qty * self.paper_entry_price
                 self.paper_euri += qty
@@ -785,9 +817,10 @@ class LUCWindow(QMainWindow):
                 self.paper_cycle_side = "LONG"
                 self.paper_state = PaperPositionState.PASSIVE_BUY
                 self.paper_cycle_state = CycleState.OPEN
+                self.paper_cycle_source = "PASSIVE"
                 self._open_lot(side="BUY", qty=qty, price=self.paper_entry_price, now_ts=now_ts, source="PASSIVE")
         elif regime == Regime.IDEAL_TRAP and trap_survivability >= min_trap and gap_ticks >= min_gap_ticks and parent_dir == "UP":
-            if self.paper_usdt >= qty * self.child_ask:
+            if self.paper_usdt >= qty * self.child_ask and self._can_open_new_cycle():
                 self.paper_entry_price = self.child_ask
                 self.paper_usdt -= qty * self.paper_entry_price
                 self.paper_euri += qty
@@ -798,10 +831,11 @@ class LUCWindow(QMainWindow):
                 self.paper_state = PaperPositionState.BUY_TRAP_ACTIVE
                 self.paper_cycle_state = CycleState.ACTIVE
                 self.paper_trap_attempts += 1
+                self.paper_cycle_source = "BUY_TRAP"
                 self._open_lot(side="BUY", qty=qty, price=self.paper_entry_price, now_ts=now_ts, source="BUY_TRAP")
                 self._paper_log("open_buy", "[PAPER] BUY_TRAP opened")
         elif regime == Regime.IDEAL_TRAP and trap_survivability >= min_trap and gap_ticks <= -min_gap_ticks and parent_dir == "DOWN":
-            if self.paper_euri >= qty:
+            if self.paper_euri >= qty and self._can_open_new_cycle():
                 self.paper_entry_price = self.child_bid
                 self.paper_euri -= qty
                 self.paper_usdt += qty * self.paper_entry_price
@@ -812,10 +846,11 @@ class LUCWindow(QMainWindow):
                 self.paper_state = PaperPositionState.SELL_TRAP_ACTIVE
                 self.paper_cycle_state = CycleState.ACTIVE
                 self.paper_trap_attempts += 1
+                self.paper_cycle_source = "SELL_TRAP"
                 self._open_lot(side="SELL", qty=qty, price=self.paper_entry_price, now_ts=now_ts, source="SELL_TRAP")
                 self._paper_log("open_sell", "[PAPER] SELL_TRAP opened")
-        if self.paper_state == PaperPositionState.FLAT and abs((self.paper_realized_pnl + unrealized) - (total_value - start_value)) > 0.8:
-            self.log("[LEDGER] pnl mismatch warning")
+        if abs((self.paper_realized_pnl + unrealized) - (total_value - start_value)) > 0.8:
+            self._warn_once("accounting_mismatch", "[WARN] accounting mismatch")
 
     def refresh_view(self) -> None:
         parent_mid = (self.parent_bid + self.parent_ask) / 2 if self.parent_bid and self.parent_ask else 0.0
@@ -1036,7 +1071,7 @@ class LUCWindow(QMainWindow):
         self.inventory_labels["active trapped qty"].setText(f"{self.paper_trapped_euri:.2f}")
 
         self.session_labels["paper state"].setText(self.paper_state.value)
-        self.session_labels["active cycle"].setText(self.paper_last_cycle)
+        self.session_labels["active cycle"].setText(f"{self.paper_last_cycle} [{self.paper_cycle_source}/{self.paper_cycle_state.value}]")
         self.session_labels["cycles"].setText(str(self.paper_cycles))
         self.session_labels["wins"].setText(str(self.paper_wins))
         self.session_labels["losses"].setText(str(self.paper_losses))
@@ -1049,7 +1084,7 @@ class LUCWindow(QMainWindow):
         self.session_labels["active lot age"].setText(f"{max(0.0, time.time() - self.paper_entry_ts):.1f}s" if self.paper_entry_ts else "0.0s")
         self.session_labels["max adverse excursion"].setText(f"{self.paper_cycle_mae:+.4f}")
         self.session_labels["partial recycle"].setText(self.paper_cycle_partial)
-        for idx, key in enumerate(["event 1", "event 2", "event 3", "event 4", "event 5"]):
+        for idx, key in enumerate(["event 1", "event 2", "event 3", "event 4", "event 5", "event 6", "event 7", "event 8"]):
             if idx < len(self.paper_ledger):
                 evt = self.paper_ledger[idx]
                 self.ledger_labels[key].setText(f"{evt['timestamp']} {evt['type']} {evt['side']} {evt['qty']:.2f} pnl={evt['realized_pnl']:+.4f}")
