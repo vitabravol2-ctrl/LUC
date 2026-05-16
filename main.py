@@ -850,7 +850,8 @@ class LUCTerminal(QMainWindow):
 
         euri_total = self._parse_total(self.euri_bal.text())
         usdt_total = self._parse_total(self.usdt_bal.text())
-        inventory_zone, _ = self._evaluate_inventory_zone(euri_total, usdt_total, euri.get("mid", 0) if euri else 0)
+        euri_mid = euri.get("mid", 0) if euri else 0
+        inventory_zone, _ = self._evaluate_inventory_zone(euri_total, usdt_total, euri_mid)
         active_orders = int(self.runtime.get("active_orders_count", 0))
 
         passive_status = "READY"
