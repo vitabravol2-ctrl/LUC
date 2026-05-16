@@ -37,7 +37,7 @@ CONFIG_PATH = Path(__file__).resolve().parent / "config" / "settings.json"
 
 def default_settings() -> dict:
     return {
-        "version": "0.1.5",
+        "version": "0.1.6",
         "binance_api_key": "",
         "binance_api_secret": "",
         "use_testnet": False,
@@ -52,6 +52,9 @@ def default_settings() -> dict:
             "eur_ws_enabled": True,
             "euri_http_poll_sec": 4,
             "max_data_age_sec": 8,
+            "eur_stale_ms": 15000,
+            "euri_stale_ms": 10000,
+            "status_hysteresis_ms": 3000,
             "tick_size": 0.0001,
         },
         "passive": {
@@ -71,10 +74,10 @@ def default_settings() -> dict:
             "cancel_if_gap_gone": True,
         },
         "risk_inventory": {
-            "inventory_safe_min": 0.0,
-            "inventory_safe_max": 0.3,
-            "inventory_danger_max": 0.6,
-            "inventory_critical_max": 0.8,
+            "inventory_safe_min": 0.35,
+            "inventory_safe_max": 0.65,
+            "inventory_danger_max": 0.80,
+            "inventory_critical_max": 0.90,
             "no_market_orders": True,
         },
     }
@@ -350,7 +353,7 @@ class LUCTerminal(QMainWindow):
         self.settings = self._load_settings()
         self.thread: QThread | None = None
         self.worker: ConnectWorker | None = None
-        self.setWindowTitle("LUC v0.1.5 — Mode Brain Foundation")
+        self.setWindowTitle("LUC v0.1.6 — Decision Stability + Dark Theme")
         self.resize(1520, 920)
         self.runtime = self._default_runtime()
         self.log_file = self._open_log_file()
@@ -367,7 +370,9 @@ class LUCTerminal(QMainWindow):
         self.started_at = time.time()
         self.last_status = {"api": "DISCONNECTED", "eur": "IDLE", "euri": "IDLE"}
         self.runtime.update({"euri_poll_count": 0, "euri_stale_count": 0, "eur_ticks": [], "active_orders_count": 0, "cycles": 0, "wins": 0, "losses": 0, "realized_pnl": 0.0, "unrealized_pnl": 0.0, "tick_capture": 0})
-        self._append_log("[v0.1.5] GUI cockpit initialized")
+        self._append_log("[v0.1.6] GUI cockpit initialized")
+        self._append_log("[STABILITY] hysteresis enabled")
+        self._append_log("[THEME] dark theme enabled")
         self._append_log("[SAFETY] No market data yet. No trading actions.")
         QTimer.singleShot(0, self._auto_start)
     def _default_runtime(self) -> dict:
@@ -414,7 +419,7 @@ class LUCTerminal(QMainWindow):
         return deep_merge(base, loaded)
 
     def _save_settings(self) -> None:
-        self.settings["version"] = "0.1.5"
+        self.settings["version"] = "0.1.6"
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
         with CONFIG_PATH.open("w", encoding="utf-8") as file:
             json.dump(self.settings, file, indent=2, ensure_ascii=False)
@@ -434,6 +439,7 @@ class LUCTerminal(QMainWindow):
         label = QLabel(text)
         label.setFrameShape(QFrame.Shape.StyledPanel)
         label.setMinimumHeight(30)
+        label.setProperty("statusType", "idle")
         return label
 
     def _make_mode_card(self, title: str, rows: list[tuple[str, str]]) -> QGroupBox:
@@ -449,7 +455,7 @@ class LUCTerminal(QMainWindow):
         self.setCentralWidget(central)
 
         top = QHBoxLayout()
-        self.version_label = self._status_label("LUC VERSION: 0.1.5")
+        self.version_label = self._status_label("LUC VERSION: 0.1.6")
         self.api_status_label = self._status_label("API STATUS: DISCONNECTED")
         self.eur_status = self._status_label("EURUSDT STATUS: IDLE")
         self.euri_status = self._status_label("EURIUSDT STATUS: IDLE")
@@ -462,11 +468,11 @@ class LUCTerminal(QMainWindow):
         modes = QGridLayout()
         self.passive_card = self._make_mode_card("PASSIVE CORRIDOR", [
             ("Status", "IDLE"), ("Spread ticks", "—"), ("Corridor state", "—"), ("Center ownership", "—"),
-            ("Recycle readiness", "—"), ("Planned action", "WAIT"), ("Block reason", "N/A")])
+            ("Recycle readiness", "—"), ("Planned action", "WAIT"), ("Block reason", "N/A"), ("Score", "0"), ("Stability", "LOW"), ("Last decision age", "—")])
         modes.addWidget(self.passive_card, 0, 0)
         self.trap_card = self._make_mode_card("AGGRESSIVE TRAP", [
             ("Status", "IDLE"), ("Fair gap ticks", "—"), ("Trap direction", "NONE"), ("Parent impulse", "—"),
-            ("Child delay", "—"), ("Weak side", "—"), ("Planned action", "WAIT"), ("Block reason", "N/A")])
+            ("Child delay", "—"), ("Weak side", "—"), ("Planned action", "WAIT"), ("Block reason", "N/A"), ("Score", "0"), ("Stability", "LOW"), ("Last decision age", "—")])
         modes.addWidget(self.trap_card, 0, 1)
         root.addLayout(modes)
 
@@ -514,6 +520,23 @@ class LUCTerminal(QMainWindow):
         self.refresh_btn = self.menu_btn
         buttons.addWidget(self.menu_btn)
         root.addLayout(buttons)
+        self._apply_theme()
+
+    def _apply_theme(self) -> None:
+        if self.settings.get("ui", {}).get("theme", "dark") != "dark":
+            return
+        self.setStyleSheet("""
+        QMainWindow, QWidget { background-color: #1b1f24; color: #d7dde5; }
+        QGroupBox { border: 1px solid #4a5360; border-radius: 8px; margin-top: 10px; padding-top: 10px; background-color: #242a31; }
+        QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; color: #cfd6df; }
+        QLabel[statusType="good"] { color: #7CFC8A; font-weight: 700; }
+        QLabel[statusType="warn"] { color: #ffb74d; font-weight: 700; }
+        QLabel[statusType="bad"] { color: #ff6b6b; font-weight: 700; }
+        QLabel[statusType="idle"] { color: #8aa0b8; }
+        QLabel[statusType="info"] { color: #6eb5ff; font-weight: 700; }
+        QPlainTextEdit { background-color: #14181d; color: #d6e0ea; border: 1px solid #3d4652; border-radius: 6px; }
+        QPushButton { background-color: #2c3440; color: #d7dde5; border: 1px solid #4a5360; border-radius: 6px; padding: 6px 10px; }
+        """)
 
     def _open_tools_menu(self) -> None:
         menu = QMenu(self)
@@ -620,11 +643,21 @@ class LUCTerminal(QMainWindow):
         critical_max = float(risk.get("inventory_critical_max", 0.8))
         if safe_min <= skew <= safe_max:
             return "SAFE", skew
-        if skew <= danger_max:
+        if skew < safe_min:
+            return "LOW_EURI", skew
+        if skew < danger_max:
             return "DANGER", skew
-        if skew <= critical_max:
+        if skew >= critical_max:
             return "CRITICAL", skew
-        return "CRITICAL", skew
+        return "DANGER", skew
+
+    @staticmethod
+    def _score_to_stability(score: int) -> str:
+        if score >= 80:
+            return "HIGH"
+        if score >= 50:
+            return "MEDIUM"
+        return "LOW"
 
     def _update_decisions(self) -> None:
         now = time.time()
@@ -702,6 +735,19 @@ class LUCTerminal(QMainWindow):
         elif current_mode == "PASSIVE_CORRIDOR":
             planned_action = "PASSIVE_BUY_SELL"
 
+        passive_score = 0
+        passive_score += 25 if data_fresh else 0
+        passive_score += 20 if spread_ticks is not None and spread_ticks <= int(passive.get("passive_max_spread_ticks", 3)) else 0
+        passive_score += 20 if fair_gap_ticks is not None and abs(fair_gap_ticks) < int(trap.get("trap_min_gap_ticks", 2)) else 0
+        passive_score += 20 if inventory_zone == "SAFE" else 0
+        passive_score += 15 if active_orders == 0 else 0
+        trap_score = 0
+        trap_score += 20 if data_fresh else 0
+        trap_score += 20 if fair_gap_ticks is not None and abs(fair_gap_ticks) >= int(trap.get("trap_min_gap_ticks", 2)) else 0
+        trap_score += 15 if spread_ticks is not None and spread_ticks <= int(trap.get("trap_max_spread_ticks", 4)) else 0
+        trap_score += 15 if inventory_zone != "CRITICAL" else 0
+        trap_score += 15 if active_orders == 0 else 0
+        trap_score += 15 if trap_dir != "SELL_TRAP" or euri_total > float(trap.get("trap_order_size", 1.0)) else 0
         decision = self.runtime["decision"]
         decision.update({
             "data_fresh": data_fresh,
@@ -719,6 +765,10 @@ class LUCTerminal(QMainWindow):
             "trap_block_reason": trap_reason,
             "block_reason": trap_reason if current_mode == "AGGRESSIVE_TRAP" else passive_reason if current_mode == "PASSIVE_CORRIDOR" else (trap_reason if trap_reason != "N/A" else passive_reason),
             "last_decision_time": now,
+            "passive_score": passive_score,
+            "trap_score": trap_score,
+            "passive_stability": self._score_to_stability(passive_score),
+            "trap_stability": self._score_to_stability(trap_score),
         })
         self._refresh_mode_cards()
         self._log_decision_changes()
@@ -735,6 +785,9 @@ class LUCTerminal(QMainWindow):
         self._set_card_value(self.passive_card, "Recycle readiness", "READY" if d["passive_status"] == "READY" else "BLOCKED")
         self._set_card_value(self.passive_card, "Planned action", "PASSIVE_BUY_SELL" if d["passive_status"] == "READY" else "WAIT")
         self._set_card_value(self.passive_card, "Block reason", d["passive_block_reason"])
+        self._set_card_value(self.passive_card, "Score", str(d.get("passive_score", 0)))
+        self._set_card_value(self.passive_card, "Stability", d.get("passive_stability", "LOW"))
+        self._set_card_value(self.passive_card, "Last decision age", f"{int((time.time() - (d.get('last_decision_time') or time.time()))*1000)} ms")
         self._set_card_value(self.trap_card, "Status", d["trap_status"])
         self._set_card_value(self.trap_card, "Fair gap ticks", str(d["fair_gap_ticks"]) if d["fair_gap_ticks"] is not None else "—")
         self._set_card_value(self.trap_card, "Trap direction", d["trap_direction"])
@@ -744,6 +797,29 @@ class LUCTerminal(QMainWindow):
         self._set_card_value(self.trap_card, "Weak side", weak_side)
         self._set_card_value(self.trap_card, "Planned action", d["planned_action"] if d["trap_status"] == "READY" else "WAIT")
         self._set_card_value(self.trap_card, "Block reason", d["trap_block_reason"])
+        self._set_card_value(self.trap_card, "Score", str(d.get("trap_score", 0)))
+        self._set_card_value(self.trap_card, "Stability", d.get("trap_stability", "LOW"))
+        self._set_card_value(self.trap_card, "Last decision age", f"{int((time.time() - (d.get('last_decision_time') or time.time()))*1000)} ms")
+        self._apply_status_colors()
+
+    def _apply_status_colors(self) -> None:
+        labels = [self.api_status_label, self.eur_status, self.euri_status, self.mode_label, self.inventory_zone]
+        for label in labels:
+            text = label.text()
+            t = "idle"
+            if any(x in text for x in ["LIVE", "READY", "SAFE", "BUY_TRAP"]):
+                t = "good"
+            if any(x in text for x in ["LOW_EURI"]):
+                t = "info"
+            if any(x in text for x in ["WAIT", "IDLE"]):
+                t = "idle"
+            if any(x in text for x in ["BLOCKED", "STALE", "DANGER", "SELL_TRAP"]):
+                t = "warn"
+            if any(x in text for x in ["ERROR", "CRITICAL"]):
+                t = "bad"
+            label.setProperty("statusType", t)
+            label.style().unpolish(label)
+            label.style().polish(label)
 
     def _set_card_value(self, card: QGroupBox, field_name: str, value: str) -> None:
         form = card.layout()
@@ -773,13 +849,22 @@ class LUCTerminal(QMainWindow):
             last["inventory_zone"] = d["inventory_zone"]
 
     def _update_market_status(self):
-        max_age = float(self.settings.get("general", {}).get("max_data_age_sec", 8))
+        general = self.settings.get("general", {})
+        eur_stale_ms = int(general.get("eur_stale_ms", 15000))
+        euri_stale_ms = int(general.get("euri_stale_ms", 10000))
+        hysteresis_ms = int(general.get("status_hysteresis_ms", 3000))
         now = time.time()
-        for key, label, prefix in [("eur", self.eur_status, "EURUSDT STATUS: "), ("euri", self.euri_status, "EURIUSDT STATUS: ")]:
+        for key, label, prefix, stale_ms in [("eur", self.eur_status, "EURUSDT STATUS: ", eur_stale_ms), ("euri", self.euri_status, "EURIUSDT STATUS: ", euri_stale_ms)]:
             data = self.runtime.get(key, {})
-            if data and now - data.get("time", now) > max_age and "ERROR" not in label.text():
+            age_ms = int((now - data.get("time", now)) * 1000) if data else 10**9
+            if "ERROR" in label.text():
+                continue
+            current = "LIVE" if "LIVE" in label.text() else "STALE" if "STALE" in label.text() else "IDLE"
+            if current == "LIVE" and age_ms > stale_ms + hysteresis_ms:
                 self.runtime["euri_stale_count"] += 1 if key == "euri" else 0
                 self._set_market_status(label, prefix + "STALE", key)
+            elif current == "STALE" and age_ms < stale_ms:
+                self._set_market_status(label, prefix + "LIVE", key)
 
     def _show_all_data(self):
         AllDataDialog(self).exec()
@@ -851,7 +936,7 @@ Filters
 {self.filters_label.text()}
 
 Runtime
-app_version=0.1.5 uptime={int(now-self.started_at)}s current_mode={self.mode_label.text()} active_orders_count={self.runtime['active_orders_count']}
+app_version=0.1.6 uptime={int(now-self.started_at)}s current_mode={self.mode_label.text()} active_orders_count={self.runtime['active_orders_count']}
 cycles={self.runtime['cycles']} wins/losses={self.runtime['wins']}/{self.runtime['losses']} realized/unrealized_pnl={self.runtime['realized_pnl']}/{self.runtime['unrealized_pnl']} tick_capture={self.runtime['tick_capture']}
 
 Decision Engine
@@ -864,6 +949,12 @@ current_mode={self.runtime['decision']['current_mode']}
 inventory_zone={self.runtime['decision']['inventory_zone']}
 planned_action={self.runtime['decision']['planned_action']}
 last_decision_time={self.runtime['decision']['last_decision_time']}
+eur_age_ms={age_ms(eur)} euri_age_ms={age_ms(euri)}
+eur_stale_ms={self.settings.get('general',{}).get('eur_stale_ms')} euri_stale_ms={self.settings.get('general',{}).get('euri_stale_ms')}
+passive_score={self.runtime['decision'].get('passive_score')}
+trap_score={self.runtime['decision'].get('trap_score')}
+passive_stability={self.runtime['decision'].get('passive_stability')}
+trap_stability={self.runtime['decision'].get('trap_stability')}
 
 Settings summary
 api_key={masked} api_secret=HIDDEN use_testnet={self.settings.get('use_testnet', False)} parent_symbol={self.settings.get('general',{}).get('parent_symbol')} base_symbol={self.settings.get('general',{}).get('base_symbol')} tick_size={tick}
