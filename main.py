@@ -37,8 +37,8 @@ CONFIG_PATH = Path(__file__).resolve().parent / "config" / "settings.json"
 
 
 def default_settings() -> dict:
-    return {
-        "version": "0.1.12",
+        return {
+            "version": "0.2.0",
         "binance_api_key": "",
         "binance_api_secret": "",
         "use_testnet": False,
@@ -82,14 +82,18 @@ def default_settings() -> dict:
             "trap_cooldown_sec": 3,
             "cancel_if_gap_gone": True,
         },
-        "risk_inventory": {
+            "risk_inventory": {
             "inventory_safe_min": 0.35,
             "inventory_safe_max": 0.65,
             "inventory_danger_max": 0.80,
             "inventory_critical_max": 0.90,
-            "no_market_orders": True,
-        },
-    }
+                "no_market_orders": True,
+            },
+            "inventory_engine": {
+                "inventory_target_ratio": 0.5,
+                "inventory_recovery_threshold": 0.12,
+            },
+        }
 
 
 def deep_merge(base: dict, incoming: dict) -> dict:
@@ -435,6 +439,7 @@ class LUCTerminal(QMainWindow):
                 "trap_direction": "NONE",
                 "planned_action": "WAIT",
                 "current_mode": "WAIT",
+                "fsm_state": "IDLE",
                 "passive_block_reason": "N/A",
                 "trap_block_reason": "N/A",
                 "block_reason": "N/A",
@@ -455,6 +460,26 @@ class LUCTerminal(QMainWindow):
             "last_error_log_times": {},
             "log_events": {},
             "order_status_by_id": {},
+            "cycles": {},
+            "next_cycle_id": 1,
+            "order_to_cycle": {},
+            "spread_ownership": "NEUTRAL",
+            "inventory": {
+                "target_ratio": 0.5,
+                "bias": "NEUTRAL",
+                "pressure": 0.0,
+                "recovery_mode": False,
+            },
+            "pnl": {
+                "realized_pnl": 0.0,
+                "unrealized_pnl": 0.0,
+                "spread_captured_ticks": 0,
+                "fees_paid": 0.0,
+                "cycle_wins": 0,
+                "cycle_losses": 0,
+                "cycle_winrate": 0.0,
+                "avg_cycle_time": 0.0,
+            },
         }
 
     def _open_log_file(self):
@@ -580,7 +605,7 @@ class LUCTerminal(QMainWindow):
 
         orders = QGroupBox("Active Orders")
         ol = QVBoxLayout(orders)
-        ol.addWidget(QLabel("side | price | qty | status | age | reason | orderId"))
+        ol.addWidget(QLabel("cycle_id | mode | leg | side | price | qty | status | age | orderId"))
         self.active_orders_view = QPlainTextEdit()
         self.active_orders_view.setReadOnly(True)
         self.active_orders_view.setMaximumHeight(130)
@@ -840,8 +865,6 @@ class LUCTerminal(QMainWindow):
             passive_status, passive_reason = "BLOCKED", "GAP_TOO_BIG"
         elif inventory_zone != "SAFE":
             passive_status, passive_reason = "BLOCKED", "INVENTORY_NOT_SAFE"
-        elif active_orders > 0:
-            passive_status, passive_reason = "IDLE", "N/A"
 
         trap_dir = "NONE"
         trap_status = "IDLE"
@@ -865,8 +888,6 @@ class LUCTerminal(QMainWindow):
             trap_status, trap_reason = "BLOCKED", "INVENTORY_CRITICAL"
         elif trap_dir == "SELL_TRAP" and euri_total <= float(trap.get("trap_order_size", 1.0)):
             trap_status, trap_reason = "BLOCKED", "NO_EURI_BALANCE"
-        elif active_orders > 0:
-            trap_status, trap_reason = "IDLE", "N/A"
         else:
             trap_status = "READY"
 
@@ -885,7 +906,7 @@ class LUCTerminal(QMainWindow):
             passive_score += 20 if spread_ticks is not None and spread_ticks <= int(passive.get("passive_max_spread_ticks", 3)) else 0
             passive_score += 20 if fair_gap_ticks is not None and abs(fair_gap_ticks) < int(trap.get("trap_min_gap_ticks", 2)) else 0
             passive_score += 20 if inventory_zone == "SAFE" else 0
-            passive_score += 15 if active_orders == 0 else 0
+            passive_score += 15
         trap_score = 0
         trap_enabled = bool(trap.get("trap_enabled", False))
         if trap_enabled:
@@ -893,8 +914,21 @@ class LUCTerminal(QMainWindow):
             trap_score += 20 if fair_gap_ticks is not None and abs(fair_gap_ticks) >= int(trap.get("trap_min_gap_ticks", 2)) else 0
             trap_score += 15 if spread_ticks is not None and spread_ticks <= int(trap.get("trap_max_spread_ticks", 4)) else 0
             trap_score += 15 if inventory_zone != "CRITICAL" else 0
-            trap_score += 15 if active_orders == 0 else 0
+            trap_score += 15
             trap_score += 15 if trap_dir != "SELL_TRAP" or euri_total > float(trap.get("trap_order_size", 1.0)) else 0
+        inv_cfg = self.settings.get("inventory_engine", {})
+        target_ratio = float(inv_cfg.get("inventory_target_ratio", 0.5))
+        _, skew = self._evaluate_inventory_zone(euri_total, usdt_total, euri_mid)
+        skew = skew if skew is not None else target_ratio
+        pressure = skew - target_ratio
+        bias = "SELL" if pressure > 0.02 else "BUY" if pressure < -0.02 else "NEUTRAL"
+        recovery_mode = abs(pressure) >= float(inv_cfg.get("inventory_recovery_threshold", 0.12))
+        self.runtime["inventory"] = {"target_ratio": target_ratio, "bias": bias, "pressure": pressure, "recovery_mode": recovery_mode}
+        ownership = "CENTER" if abs(fair_gap_ticks or 0) <= 1 else "ASK_CONTROL" if (fair_gap_ticks or 0) > 1 else "BID_CONTROL"
+        self.runtime["spread_ownership"] = ownership
+        fsm_state = "TRAP_RUNNING" if current_mode == "AGGRESSIVE_TRAP" else "PASSIVE_RUNNING" if current_mode == "PASSIVE_CORRIDOR" else "IDLE"
+        if recovery_mode:
+            fsm_state = "INVENTORY_RECOVERY"
         decision = self.runtime["decision"]
         decision.update({
             "data_fresh": data_fresh,
@@ -911,6 +945,7 @@ class LUCTerminal(QMainWindow):
             "trap_direction": trap_dir,
             "planned_action": planned_action,
             "current_mode": current_mode,
+            "fsm_state": fsm_state,
             "passive_block_reason": passive_reason,
             "trap_block_reason": trap_reason,
             "block_reason": trap_reason if current_mode == "AGGRESSIVE_TRAP" else passive_reason if current_mode == "PASSIVE_CORRIDOR" else (trap_reason if trap_reason != "N/A" else passive_reason),
@@ -932,7 +967,7 @@ class LUCTerminal(QMainWindow):
         self._set_card_value(self.passive_card, "Spread ticks", str(d["euri_spread_ticks"]) if d["euri_spread_ticks"] is not None else "—")
         corridor_state = "UNKNOWN" if not self.runtime.get("euri") else ("STALE" if not d["data_fresh"] else ("WIDE" if (d["euri_spread_ticks"] or 0) > int(self.settings.get("passive", {}).get("passive_max_spread_ticks", 3)) else "STABLE"))
         self._set_card_value(self.passive_card, "Corridor state", corridor_state)
-        self._set_card_value(self.passive_card, "Center ownership", "NONE")
+        self._set_card_value(self.passive_card, "Center ownership", self.runtime.get("spread_ownership", "NEUTRAL"))
         self._set_card_value(self.passive_card, "Recycle readiness", "READY" if d["passive_status"] == "READY" else "BLOCKED")
         self._set_card_value(self.passive_card, "Planned action", "PASSIVE_BUY_SELL" if d["passive_status"] == "READY" else "WAIT")
         self._set_card_value(self.passive_card, "Block reason", d["passive_block_reason"])
@@ -1040,6 +1075,31 @@ class LUCTerminal(QMainWindow):
         self._log_once_or_changed("execution_trading_state", f"[EXECUTION] trading {state}", 2)
         self._update_trading_button()
 
+    def _create_cycle(self, mode: str, entry_side: str, entry_price: float, qty: float, target_ticks: int) -> dict:
+        cycle_id = str(self.runtime.get("next_cycle_id", 1))
+        self.runtime["next_cycle_id"] = int(self.runtime.get("next_cycle_id", 1)) + 1
+        tick = float(self.settings.get("general", {}).get("tick_size", 0.0001))
+        exit_side = "SELL" if entry_side == "BUY" else "BUY"
+        delta = tick * max(1, int(target_ticks))
+        exit_price = entry_price + delta if entry_side == "BUY" else max(tick, entry_price - delta)
+        cycle = {
+            "cycle_id": cycle_id,
+            "mode": mode,
+            "entry_side": entry_side,
+            "exit_side": exit_side,
+            "entry_order_id": None,
+            "exit_order_id": None,
+            "entry_price": entry_price,
+            "exit_price": exit_price,
+            "qty": qty,
+            "state": "ENTRY_PENDING",
+            "created_ts": time.time(),
+            "updated_ts": time.time(),
+        }
+        self.runtime.setdefault("cycles", {})[cycle_id] = cycle
+        self._append_log(f"[CYCLE] created {mode} #{cycle_id}")
+        return cycle
+
     def _prepare_order(self) -> dict | None:
         d = self.runtime.get("decision", {})
         general = self.settings.get("general", {})
@@ -1056,7 +1116,7 @@ class LUCTerminal(QMainWindow):
         if not bool(general.get("trading_enabled", False)) or not bool(general.get("allow_auto_orders", True)):
             self.runtime["last_execution_block_reason"] = "TRADING_DISABLED"
             return None
-        if d.get("current_mode") == "WAIT" or self.runtime.get("active_orders_count", 0) > 0 or not d.get("data_fresh"):
+        if d.get("current_mode") == "WAIT" or not d.get("data_fresh"):
             self.runtime["last_execution_block_reason"] = "WAIT_OR_ACTIVE_ORDERS_OR_STALE"
             return None
         if not bool(risk.get("no_market_orders", True)):
@@ -1068,19 +1128,31 @@ class LUCTerminal(QMainWindow):
         price = 0.0
         reason = ""
         target = ""
+        cycle_mode = "PASSIVE"
+        target_ticks = int(passive.get("passive_target_ticks", 1))
         if mode == "AGGRESSIVE_TRAP":
             if d.get("trap_direction") == "BUY_TRAP":
                 side, qty, price, reason, target = "BUY", float(trap.get("trap_order_size", 1.0)), float(euri.get("ask", 0.0)), "BUY_TRAP fair_gap", "SELL +1 tick"
+                cycle_mode = "BUY_TRAP"
+                target_ticks = int(trap.get("trap_target_ticks", 1))
             elif d.get("trap_direction") == "SELL_TRAP":
                 free = self._parse_free(self.euri_bal.text())
                 side, qty, price, reason, target = "SELL", min(float(trap.get("trap_order_size", 1.0)), free), float(euri.get("bid", 0.0)), "SELL_TRAP fair_gap", "BUY -1 tick"
+                cycle_mode = "SELL_TRAP"
+                target_ticks = int(trap.get("trap_target_ticks", 1))
         elif mode == "PASSIVE_CORRIDOR":
-            side, qty, price, reason, target = "BUY", float(passive.get("passive_order_size", 1.0)), float(euri.get("bid", 0.0)), "PASSIVE_CORRIDOR recycle", "sell corridor"
+            inv_bias = self.runtime.get("inventory", {}).get("bias", "NEUTRAL")
+            if inv_bias == "SELL":
+                side, qty, price = "SELL", float(passive.get("passive_order_size", 1.0)), float(euri.get("ask", 0.0))
+            else:
+                side, qty, price = "BUY", float(passive.get("passive_order_size", 1.0)), float(euri.get("bid", 0.0))
+            reason, target = "PASSIVE_CORRIDOR recycle", "paired passive recycle"
         if not side or qty <= 0 or price <= 0:
             self.runtime["last_execution_block_reason"] = "INVALID_PROPOSAL"
             return None
         self.runtime["last_execution_block_reason"] = "NONE"
-        return self._preflight_order({"mode": mode, "side": side, "symbol": "EURIUSDT", "price": price, "qty": qty, "reason": reason, "target": target})
+        cycle = self._create_cycle(cycle_mode, side, price, qty, target_ticks)
+        return self._preflight_order({"mode": mode, "cycle_id": cycle["cycle_id"], "side": side, "symbol": "EURIUSDT", "price": price, "qty": qty, "reason": reason, "target": target})
 
     @staticmethod
     def _round_down(value: float, step: float) -> float:
@@ -1123,9 +1195,6 @@ class LUCTerminal(QMainWindow):
         if qty > max_live:
             self.runtime["last_block_reason"] = "MAX_LIVE_ORDER_SIZE"
             self._append_log(f"[ORDER_BLOCKED] MAX_LIVE_ORDER_SIZE qty={qty:.6f} max_live_order_size={max_live:.6f}")
-            return None
-        if self.runtime.get("active_orders_count", 0) > 0:
-            self.runtime["last_block_reason"] = "ACTIVE_ORDER_EXISTS"
             return None
         usdt_free = self._parse_free(self.usdt_bal.text())
         euri_free = self._parse_free(self.euri_bal.text())
@@ -1170,7 +1239,15 @@ class LUCTerminal(QMainWindow):
                 resp = self.client.place_limit_buy(order["symbol"], order["qty"], order["price"])
             else:
                 resp = self.client.place_limit_sell(order["symbol"], order["qty"], order["price"])
-            self._append_log(f"[ORDER] order sent id={resp.get('orderId')}")
+            order_id = resp.get("orderId")
+            cycle_id = order.get("cycle_id")
+            if cycle_id and cycle_id in self.runtime.get("cycles", {}):
+                c = self.runtime["cycles"][cycle_id]
+                c["entry_order_id"] = order_id
+                c["state"] = "ENTRY_PENDING"
+                c["updated_ts"] = time.time()
+                self.runtime.setdefault("order_to_cycle", {})[str(order_id)] = cycle_id
+            self._append_log(f"[ORDER] order sent id={order_id}")
             self._append_trade_log("ORDER_SENT", f"id={resp.get('orderId')} side={order['side']} qty={order['qty']:.6f} price={order['price']:.6f}")
             self._refresh_open_orders()
             self._refresh_balances_only()
@@ -1207,7 +1284,12 @@ class LUCTerminal(QMainWindow):
                 status = o.get("status")
                 if status in {"FILLED", "CANCELED"} and age > 10:
                     continue
-                lines.append(f"{o.get('side')} | {o.get('price')} | {o.get('origQty')} | {status} | {age}s | {o.get('clientOrderId','')} | {o.get('orderId')}")
+                order_id = str(o.get("orderId"))
+                cycle_id = self.runtime.get("order_to_cycle", {}).get(order_id, "-")
+                cycle = self.runtime.get("cycles", {}).get(cycle_id, {})
+                mode = cycle.get("mode", "-")
+                leg = "ENTRY" if cycle.get("entry_order_id") == o.get("orderId") else "EXIT" if cycle.get("exit_order_id") == o.get("orderId") else "-"
+                lines.append(f"{cycle_id} | {mode} | {leg} | {o.get('side')} | {o.get('price')} | {o.get('origQty')} | {status} | {age}s | {o.get('orderId')}")
             self.active_orders_view.setPlainText("\n".join(lines) if lines else "No active orders.")
             if prev_count != len(orders):
                 self._append_log(f"[ORDER] open orders count changed: {prev_count} -> {len(orders)}")
