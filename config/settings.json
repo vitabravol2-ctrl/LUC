@@ -1,26 +1,48 @@
 {
-  "version": "0.1.1",
+  "version": "0.1.6",
   "binance_api_key": "",
   "binance_api_secret": "",
   "use_testnet": false,
   "ui": {
-    "latest_logs_rows": 200,
+    "latest_logs_rows": 220,
     "theme": "dark"
   },
-  "runtime": {
-    "poll_interval_sec": 1.0,
-    "max_open_cycles": 1
+  "general": {
+    "base_symbol": "EURIUSDT",
+    "parent_symbol": "EURUSDT",
+    "max_open_cycles": 1,
+    "default_order_size": 1.0,
+    "max_inventory_shift": 0.2,
+    "max_hold_sec": 30,
+    "eur_ws_enabled": true,
+    "euri_http_poll_sec": 4,
+    "max_data_age_sec": 8,
+    "eur_stale_ms": 15000,
+    "euri_stale_ms": 10000,
+    "status_hysteresis_ms": 3000,
+    "tick_size": 0.0001
   },
-  "trading": {
-    "order_size": 1.0,
-    "min_gap_ticks": 1,
-    "max_spread_ticks": 3,
-    "target_ticks": 1,
-    "max_hold_sec": 30
+  "passive": {
+    "passive_enabled": true,
+    "passive_max_spread_ticks": 3,
+    "passive_target_ticks": 1,
+    "passive_order_size": 1.0,
+    "passive_cooldown_sec": 2
   },
-  "inventory": {
-    "safe": 0.3,
-    "danger": 0.6,
-    "critical": 0.8
+  "trap": {
+    "trap_enabled": false,
+    "trap_min_gap_ticks": 2,
+    "trap_max_spread_ticks": 4,
+    "trap_target_ticks": 1,
+    "trap_order_size": 1.0,
+    "trap_cooldown_sec": 3,
+    "cancel_if_gap_gone": true
+  },
+  "risk_inventory": {
+    "inventory_safe_min": 0.35,
+    "inventory_safe_max": 0.65,
+    "inventory_danger_max": 0.8,
+    "inventory_critical_max": 0.9,
+    "no_market_orders": true
   }
 }
