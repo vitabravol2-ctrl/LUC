@@ -37,7 +37,7 @@ CONFIG_PATH = Path(__file__).resolve().parent / "config" / "settings.json"
 
 def default_settings() -> dict:
     return {
-        "version": "0.1.4",
+        "version": "0.1.5",
         "binance_api_key": "",
         "binance_api_secret": "",
         "use_testnet": False,
@@ -350,7 +350,7 @@ class LUCTerminal(QMainWindow):
         self.settings = self._load_settings()
         self.thread: QThread | None = None
         self.worker: ConnectWorker | None = None
-        self.setWindowTitle("LUC v0.1.4 — Auto Connect + Live Dashboard")
+        self.setWindowTitle("LUC v0.1.5 — Mode Brain Foundation")
         self.resize(1520, 920)
         self.runtime = self._default_runtime()
         self.log_file = self._open_log_file()
@@ -367,11 +367,37 @@ class LUCTerminal(QMainWindow):
         self.started_at = time.time()
         self.last_status = {"api": "DISCONNECTED", "eur": "IDLE", "euri": "IDLE"}
         self.runtime.update({"euri_poll_count": 0, "euri_stale_count": 0, "eur_ticks": [], "active_orders_count": 0, "cycles": 0, "wins": 0, "losses": 0, "realized_pnl": 0.0, "unrealized_pnl": 0.0, "tick_capture": 0})
-        self._append_log("[v0.1.4] GUI cockpit initialized")
+        self._append_log("[v0.1.5] GUI cockpit initialized")
         self._append_log("[SAFETY] No market data yet. No trading actions.")
         QTimer.singleShot(0, self._auto_start)
     def _default_runtime(self) -> dict:
-        return {"eur": {}, "euri": {}, "fair_gap": None, "fair_gap_ticks": None, "trap_direction": "NONE", "passive_readiness": "BLOCKED", "source": {}}
+        return {
+            "eur": {},
+            "euri": {},
+            "fair_gap": None,
+            "fair_gap_ticks": None,
+            "trap_direction": "NONE",
+            "passive_readiness": "IDLE",
+            "source": {},
+            "decision": {
+                "data_fresh": False,
+                "euri_spread_ticks": None,
+                "fair_gap_ticks": None,
+                "parent_impulse": "UNKNOWN",
+                "child_delay_ms": None,
+                "inventory_zone": "UNKNOWN",
+                "passive_status": "IDLE",
+                "trap_status": "IDLE",
+                "trap_direction": "NONE",
+                "planned_action": "WAIT",
+                "current_mode": "WAIT",
+                "passive_block_reason": "N/A",
+                "trap_block_reason": "N/A",
+                "block_reason": "N/A",
+                "last_decision_time": None,
+            },
+            "last_logged": {"mode": None, "passive_status": None, "trap_direction": None, "inventory_zone": None},
+        }
 
     def _open_log_file(self):
         logs_dir = CONFIG_PATH.parent / "logs"
@@ -388,7 +414,7 @@ class LUCTerminal(QMainWindow):
         return deep_merge(base, loaded)
 
     def _save_settings(self) -> None:
-        self.settings["version"] = "0.1.4"
+        self.settings["version"] = "0.1.5"
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
         with CONFIG_PATH.open("w", encoding="utf-8") as file:
             json.dump(self.settings, file, indent=2, ensure_ascii=False)
@@ -423,7 +449,7 @@ class LUCTerminal(QMainWindow):
         self.setCentralWidget(central)
 
         top = QHBoxLayout()
-        self.version_label = self._status_label("LUC VERSION: 0.1.4")
+        self.version_label = self._status_label("LUC VERSION: 0.1.5")
         self.api_status_label = self._status_label("API STATUS: DISCONNECTED")
         self.eur_status = self._status_label("EURUSDT STATUS: IDLE")
         self.euri_status = self._status_label("EURIUSDT STATUS: IDLE")
@@ -436,11 +462,11 @@ class LUCTerminal(QMainWindow):
         modes = QGridLayout()
         self.passive_card = self._make_mode_card("PASSIVE CORRIDOR", [
             ("Status", "IDLE"), ("Spread ticks", "—"), ("Corridor state", "—"), ("Center ownership", "—"),
-            ("Recycle readiness", "—"), ("Planned action", "NONE"), ("Block reason", "N/A")])
+            ("Recycle readiness", "—"), ("Planned action", "WAIT"), ("Block reason", "N/A")])
         modes.addWidget(self.passive_card, 0, 0)
         self.trap_card = self._make_mode_card("AGGRESSIVE TRAP", [
             ("Status", "IDLE"), ("Fair gap ticks", "—"), ("Trap direction", "NONE"), ("Parent impulse", "—"),
-            ("Child delay", "—"), ("Weak side", "—"), ("Planned action", "NONE"), ("Block reason", "N/A")])
+            ("Child delay", "—"), ("Weak side", "—"), ("Planned action", "WAIT"), ("Block reason", "N/A")])
         modes.addWidget(self.trap_card, 0, 1)
         root.addLayout(modes)
 
@@ -580,12 +606,171 @@ class LUCTerminal(QMainWindow):
         gap = eur["mid"] - euri["mid"]
         self.runtime["fair_gap"] = gap
         self.runtime["fair_gap_ticks"] = self._ticks(gap)
-        trap_min = int(self.settings.get("trap", {}).get("trap_min_gap_ticks", 2))
-        old_dir = self.runtime.get("trap_direction", "NONE")
-        new_dir = "BUY_TRAP" if self.runtime["fair_gap_ticks"] >= trap_min else "SELL_TRAP" if self.runtime["fair_gap_ticks"] <= -trap_min else "NONE"
-        self.runtime["trap_direction"] = new_dir
-        if new_dir != old_dir:
-            self._append_log(f"[TRAP] direction changed: {old_dir} -> {new_dir}")
+        self._update_decisions()
+
+    def _evaluate_inventory_zone(self, euri_total: float, usdt_total: float, euri_mid: float) -> tuple[str, float | None]:
+        total_euri_equiv = euri_total + (usdt_total / max(euri_mid, 1e-9) if euri_mid > 0 else 0.0)
+        if total_euri_equiv <= 0:
+            return "SAFE", None
+        skew = euri_total / total_euri_equiv
+        risk = self.settings.get("risk_inventory", {})
+        safe_min = float(risk.get("inventory_safe_min", 0.0))
+        safe_max = float(risk.get("inventory_safe_max", 0.3))
+        danger_max = float(risk.get("inventory_danger_max", 0.6))
+        critical_max = float(risk.get("inventory_critical_max", 0.8))
+        if safe_min <= skew <= safe_max:
+            return "SAFE", skew
+        if skew <= danger_max:
+            return "DANGER", skew
+        if skew <= critical_max:
+            return "CRITICAL", skew
+        return "CRITICAL", skew
+
+    def _update_decisions(self) -> None:
+        now = time.time()
+        eur, euri = self.runtime.get("eur", {}), self.runtime.get("euri", {})
+        general = self.settings.get("general", {})
+        passive = self.settings.get("passive", {})
+        trap = self.settings.get("trap", {})
+        max_age = float(general.get("max_data_age_sec", 8))
+        eur_fresh = bool(eur) and (now - eur.get("time", 0) <= max_age)
+        euri_fresh = bool(euri) and (now - euri.get("time", 0) <= max_age)
+        data_fresh = eur_fresh and euri_fresh
+        spread_ticks = euri.get("spread_ticks")
+        fair_gap_ticks = self.runtime.get("fair_gap_ticks")
+        child_delay_ms = int((now - euri.get("time", now)) * 1000) if euri else None
+        parent_impulse = "UNKNOWN"
+        if eur_fresh and len(self.runtime.get("eur_ticks", [])) >= 6:
+            recent = [t for t in self.runtime["eur_ticks"] if now - t <= 2]
+            parent_impulse = "UP" if len(recent) >= 4 and fair_gap_ticks is not None and fair_gap_ticks > 0 else "DOWN" if len(recent) >= 4 and fair_gap_ticks is not None and fair_gap_ticks < 0 else "CALM"
+        elif eur_fresh:
+            parent_impulse = "CALM"
+
+        euri_total = self._parse_total(self.euri_bal.text())
+        usdt_total = self._parse_total(self.usdt_bal.text())
+        inventory_zone, _ = self._evaluate_inventory_zone(euri_total, usdt_total, euri.get("mid", 0) if euri else 0)
+        active_orders = int(self.runtime.get("active_orders_count", 0))
+
+        passive_status = "READY"
+        passive_reason = "N/A"
+        if not bool(passive.get("passive_enabled", True)):
+            passive_status, passive_reason = "BLOCKED", "DISABLED"
+        elif not data_fresh:
+            passive_status, passive_reason = "BLOCKED", "DATA_STALE"
+        elif spread_ticks is None or spread_ticks > int(passive.get("passive_max_spread_ticks", 3)):
+            passive_status, passive_reason = "BLOCKED", "SPREAD_TOO_WIDE"
+        elif fair_gap_ticks is None or abs(fair_gap_ticks) >= int(trap.get("trap_min_gap_ticks", 2)):
+            passive_status, passive_reason = "BLOCKED", "GAP_TOO_BIG"
+        elif inventory_zone != "SAFE":
+            passive_status, passive_reason = "BLOCKED", "INVENTORY_NOT_SAFE"
+        elif active_orders > 0:
+            passive_status, passive_reason = "IDLE", "N/A"
+
+        trap_dir = "NONE"
+        trap_status = "IDLE"
+        trap_reason = "N/A"
+        trap_min_gap = int(trap.get("trap_min_gap_ticks", 2))
+        if fair_gap_ticks is not None:
+            if fair_gap_ticks >= trap_min_gap:
+                trap_dir = "BUY_TRAP"
+            elif fair_gap_ticks <= -trap_min_gap:
+                trap_dir = "SELL_TRAP"
+
+        if not bool(trap.get("trap_enabled", False)):
+            trap_status, trap_reason = "BLOCKED", "DISABLED"
+        elif not data_fresh:
+            trap_status, trap_reason = "BLOCKED", "DATA_STALE"
+        elif trap_dir == "NONE":
+            trap_status, trap_reason = "BLOCKED", "GAP_TOO_SMALL"
+        elif spread_ticks is None or spread_ticks > int(trap.get("trap_max_spread_ticks", 3)):
+            trap_status, trap_reason = "BLOCKED", "SPREAD_TOO_WIDE"
+        elif inventory_zone == "CRITICAL":
+            trap_status, trap_reason = "BLOCKED", "INVENTORY_CRITICAL"
+        elif trap_dir == "SELL_TRAP" and euri_total <= float(trap.get("trap_order_size", 1.0)):
+            trap_status, trap_reason = "BLOCKED", "NO_EURI_BALANCE"
+        elif active_orders > 0:
+            trap_status, trap_reason = "IDLE", "N/A"
+        else:
+            trap_status = "READY"
+
+        current_mode = "AGGRESSIVE_TRAP" if trap_status == "READY" else "PASSIVE_CORRIDOR" if passive_status == "READY" else "WAIT"
+        planned_action = "WAIT"
+        if current_mode == "AGGRESSIVE_TRAP" and trap_dir == "BUY_TRAP":
+            planned_action = "BUY_EURI_THEN_SELL_PLUS_1"
+        elif current_mode == "AGGRESSIVE_TRAP" and trap_dir == "SELL_TRAP":
+            planned_action = "SELL_EURI_THEN_BUY_MINUS_1"
+        elif current_mode == "PASSIVE_CORRIDOR":
+            planned_action = "PASSIVE_BUY_SELL"
+
+        decision = self.runtime["decision"]
+        decision.update({
+            "data_fresh": data_fresh,
+            "euri_spread_ticks": spread_ticks,
+            "fair_gap_ticks": fair_gap_ticks,
+            "parent_impulse": parent_impulse,
+            "child_delay_ms": child_delay_ms,
+            "inventory_zone": inventory_zone,
+            "passive_status": passive_status,
+            "trap_status": trap_status,
+            "trap_direction": trap_dir,
+            "planned_action": planned_action,
+            "current_mode": current_mode,
+            "passive_block_reason": passive_reason,
+            "trap_block_reason": trap_reason,
+            "block_reason": trap_reason if current_mode == "AGGRESSIVE_TRAP" else passive_reason if current_mode == "PASSIVE_CORRIDOR" else (trap_reason if trap_reason != "N/A" else passive_reason),
+            "last_decision_time": now,
+        })
+        self._refresh_mode_cards()
+        self._log_decision_changes()
+
+    def _refresh_mode_cards(self) -> None:
+        d = self.runtime["decision"]
+        self.mode_label.setText(f"CURRENT MODE: {d['current_mode']}")
+        self.inventory_zone.setText(f"INVENTORY ZONE: {d['inventory_zone']}")
+        self._set_card_value(self.passive_card, "Status", d["passive_status"])
+        self._set_card_value(self.passive_card, "Spread ticks", str(d["euri_spread_ticks"]) if d["euri_spread_ticks"] is not None else "—")
+        corridor_state = "UNKNOWN" if not self.runtime.get("euri") else ("STALE" if not d["data_fresh"] else ("WIDE" if (d["euri_spread_ticks"] or 0) > int(self.settings.get("passive", {}).get("passive_max_spread_ticks", 3)) else "STABLE"))
+        self._set_card_value(self.passive_card, "Corridor state", corridor_state)
+        self._set_card_value(self.passive_card, "Center ownership", "NONE")
+        self._set_card_value(self.passive_card, "Recycle readiness", "READY" if d["passive_status"] == "READY" else "BLOCKED")
+        self._set_card_value(self.passive_card, "Planned action", "PASSIVE_BUY_SELL" if d["passive_status"] == "READY" else "WAIT")
+        self._set_card_value(self.passive_card, "Block reason", d["passive_block_reason"])
+        self._set_card_value(self.trap_card, "Status", d["trap_status"])
+        self._set_card_value(self.trap_card, "Fair gap ticks", str(d["fair_gap_ticks"]) if d["fair_gap_ticks"] is not None else "—")
+        self._set_card_value(self.trap_card, "Trap direction", d["trap_direction"])
+        self._set_card_value(self.trap_card, "Parent impulse", d["parent_impulse"])
+        self._set_card_value(self.trap_card, "Child delay", f"{d['child_delay_ms']} ms" if d["child_delay_ms"] is not None else "—")
+        weak_side = "ASK" if d["trap_direction"] == "BUY_TRAP" else "BID" if d["trap_direction"] == "SELL_TRAP" else "NONE"
+        self._set_card_value(self.trap_card, "Weak side", weak_side)
+        self._set_card_value(self.trap_card, "Planned action", d["planned_action"] if d["trap_status"] == "READY" else "WAIT")
+        self._set_card_value(self.trap_card, "Block reason", d["trap_block_reason"])
+
+    def _set_card_value(self, card: QGroupBox, field_name: str, value: str) -> None:
+        form = card.layout()
+        if not isinstance(form, QFormLayout):
+            return
+        for i in range(form.rowCount()):
+            label_w = form.itemAt(i, QFormLayout.ItemRole.LabelRole).widget()
+            field_w = form.itemAt(i, QFormLayout.ItemRole.FieldRole).widget()
+            if isinstance(label_w, QLabel) and isinstance(field_w, QLabel) and label_w.text() == field_name and field_w.text() != value:
+                field_w.setText(value)
+                return
+
+    def _log_decision_changes(self) -> None:
+        d = self.runtime["decision"]
+        last = self.runtime["last_logged"]
+        if last["mode"] != d["current_mode"]:
+            self._append_log(f"[MODE] current mode changed: {last['mode']} -> {d['current_mode']}")
+            last["mode"] = d["current_mode"]
+        if last["passive_status"] != d["passive_status"]:
+            self._append_log(f"[PASSIVE] status changed: {last['passive_status']} -> {d['passive_status']}")
+            last["passive_status"] = d["passive_status"]
+        if last["trap_direction"] != d["trap_direction"]:
+            self._append_log(f"[TRAP] direction changed: {last['trap_direction']} -> {d['trap_direction']}")
+            last["trap_direction"] = d["trap_direction"]
+        if last["inventory_zone"] != d["inventory_zone"]:
+            self._append_log(f"[INVENTORY] zone changed: {last['inventory_zone']} -> {d['inventory_zone']}")
+            last["inventory_zone"] = d["inventory_zone"]
 
     def _update_market_status(self):
         max_age = float(self.settings.get("general", {}).get("max_data_age_sec", 8))
@@ -666,8 +851,19 @@ Filters
 {self.filters_label.text()}
 
 Runtime
-app_version=0.1.4 uptime={int(now-self.started_at)}s current_mode={self.mode_label.text()} active_orders_count={self.runtime['active_orders_count']}
+app_version=0.1.5 uptime={int(now-self.started_at)}s current_mode={self.mode_label.text()} active_orders_count={self.runtime['active_orders_count']}
 cycles={self.runtime['cycles']} wins/losses={self.runtime['wins']}/{self.runtime['losses']} realized/unrealized_pnl={self.runtime['realized_pnl']}/{self.runtime['unrealized_pnl']} tick_capture={self.runtime['tick_capture']}
+
+Decision Engine
+passive_status={self.runtime['decision']['passive_status']}
+passive_block_reason={self.runtime['decision']['passive_block_reason']}
+trap_status={self.runtime['decision']['trap_status']}
+trap_direction={self.runtime['decision']['trap_direction']}
+trap_block_reason={self.runtime['decision']['trap_block_reason']}
+current_mode={self.runtime['decision']['current_mode']}
+inventory_zone={self.runtime['decision']['inventory_zone']}
+planned_action={self.runtime['decision']['planned_action']}
+last_decision_time={self.runtime['decision']['last_decision_time']}
 
 Settings summary
 api_key={masked} api_secret=HIDDEN use_testnet={self.settings.get('use_testnet', False)} parent_symbol={self.settings.get('general',{}).get('parent_symbol')} base_symbol={self.settings.get('general',{}).get('base_symbol')} tick_size={tick}
