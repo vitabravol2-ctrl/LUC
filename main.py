@@ -38,7 +38,7 @@ CONFIG_PATH = Path(__file__).resolve().parent / "config" / "settings.json"
 
 def default_settings() -> dict:
         return {
-            "version": "0.2.1",
+            "version": "0.2.2",
         "binance_api_key": "",
         "binance_api_secret": "",
         "use_testnet": False,
@@ -182,6 +182,9 @@ class BinanceClient:
 
     def get_open_orders(self, symbol: str) -> list:
         return self._request("GET", "/api/v3/openOrders", params={"symbol": symbol}, signed=True)
+
+    def get_order(self, symbol: str, order_id: int) -> dict:
+        return self._request("GET", "/api/v3/order", params={"symbol": symbol, "orderId": order_id}, signed=True)
 class ConnectWorker(QObject):
     log = Signal(str)
     status = Signal(str)
@@ -385,7 +388,7 @@ class LUCTerminal(QMainWindow):
         self.settings = self._load_settings()
         self.thread: QThread | None = None
         self.worker: ConnectWorker | None = None
-        self.setWindowTitle("LUC v0.2.1 — Critical Runtime Schema Fix + Cycle Engine Stabilization")
+        self.setWindowTitle("LUC v0.2.2 — Cycle Lifecycle: Entry Fill Detection + Exit Leg Placement")
         self.resize(1520, 920)
         self.runtime = self._default_runtime()
         self.log_file = self._open_log_file()
@@ -409,10 +412,13 @@ class LUCTerminal(QMainWindow):
         self.client: BinanceClient | None = None
         self.open_orders_timer = QTimer(self)
         self.open_orders_timer.timeout.connect(self._refresh_open_orders)
+        self.cycle_sync_timer = QTimer(self)
+        self.cycle_sync_timer.timeout.connect(self._sync_cycles)
+        self.cycle_sync_timer.start(3000)
         self._update_trading_button()
         self.last_status = {"api": "DISCONNECTED", "eur": "IDLE", "euri": "IDLE"}
         self.runtime.update({"euri_poll_count": 0, "euri_stale_count": 0, "eur_ticks": [], "active_orders_count": 0, "realized_pnl": 0.0, "unrealized_pnl": 0.0, "tick_capture": 0})
-        self._append_log("[v0.2.1] GUI cockpit initialized")
+        self._append_log("[v0.2.2] GUI cockpit initialized")
         self._append_log("[STABILITY] hysteresis enabled")
         self._append_log("[THEME] dark theme enabled")
         self._append_log("[SAFETY] No market data yet. No trading actions.")
@@ -503,7 +509,7 @@ class LUCTerminal(QMainWindow):
         return deep_merge(base, loaded)
 
     def _save_settings(self) -> None:
-        self.settings["version"] = "0.2.1"
+        self.settings["version"] = "0.2.2"
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
         with CONFIG_PATH.open("w", encoding="utf-8") as file:
             json.dump(self.settings, file, indent=2, ensure_ascii=False)
@@ -1117,6 +1123,7 @@ class LUCTerminal(QMainWindow):
             "entry_price": entry_price,
             "exit_price": exit_price,
             "qty": qty,
+            "target_ticks": target_ticks,
             "state": "ENTRY_PENDING",
             "created_ts": time.time(),
             "updated_ts": time.time(),
@@ -1188,8 +1195,8 @@ class LUCTerminal(QMainWindow):
             self.runtime["last_execution_block_reason"] = "CYCLE_CREATE_COOLDOWN"
             return None
         for c in self.runtime.get("cycles_map", {}).values():
-            if c.get("state") in {"ENTRY_PENDING", "ACTIVE"} and c.get("mode") == cycle_mode and c.get("entry_side") == side and abs(float(c.get("entry_price", 0.0)) - float(preflight["price"])) < 1e-12:
-                self.runtime["last_execution_block_reason"] = "DUPLICATE_ACTIVE_CYCLE"
+            if c.get("state") in {"ENTRY_PENDING", "ENTRY_FILLED", "EXIT_PENDING"}:
+                self.runtime["last_execution_block_reason"] = "ACTIVE_CYCLE_IN_PROGRESS"
                 return None
         cycle = self._create_cycle(cycle_mode, side, float(preflight["price"]), float(preflight["qty"]), target_ticks)
         preflight["cycle_id"] = cycle["cycle_id"]
@@ -1334,6 +1341,15 @@ class LUCTerminal(QMainWindow):
                 mode = cycle.get("mode", "-")
                 leg = "ENTRY" if cycle.get("entry_order_id") == o.get("orderId") else "EXIT" if cycle.get("exit_order_id") == o.get("orderId") else "-"
                 lines.append(f"{cycle_id} | {mode} | {leg} | {o.get('side')} | {o.get('price')} | {o.get('origQty')} | {status} | {age}s | {o.get('orderId')}")
+            for cycle_id, cycle in sorted(self.runtime.get("cycles_map", {}).items(), key=lambda x: int(x[0])):
+                state = cycle.get("state", "-")
+                if state not in {"ENTRY_PENDING", "ENTRY_FILLED", "EXIT_PENDING", "COMPLETED"}:
+                    continue
+                lines.append(
+                    f"{cycle_id} | {cycle.get('mode', '-')} | CYCLE | {cycle.get('entry_side', '-')}/{cycle.get('exit_side', '-')} | "
+                    f"{cycle.get('entry_price', 0.0):.8f}->{cycle.get('exit_price', 0.0):.8f} | {cycle.get('qty', 0.0):.8f} | {state} | - | "
+                    f"{cycle.get('entry_order_id', '-')}/{cycle.get('exit_order_id', '-')}"
+                )
             self.active_orders_view.setPlainText("\n".join(lines) if lines else "No active orders.")
             if prev_count != len(orders):
                 self._append_log(f"[ORDER] open orders count changed: {prev_count} -> {len(orders)}")
@@ -1345,6 +1361,95 @@ class LUCTerminal(QMainWindow):
             self.runtime["order_status_by_id"] = current_statuses
         except Exception as exc:
             self._append_log(f"[ORDER] open orders refresh error: {exc}")
+
+    def _sync_cycles(self) -> None:
+        if not self.client:
+            return
+        cycles_map = self.runtime.get("cycles_map", {})
+        if not isinstance(cycles_map, dict):
+            return
+        for cycle_id, cycle in list(cycles_map.items()):
+            state = cycle.get("state")
+            try:
+                if state == "ENTRY_PENDING":
+                    entry_order_id = cycle.get("entry_order_id")
+                    if not entry_order_id:
+                        continue
+                    entry = self.client.get_order("EURIUSDT", int(entry_order_id))
+                    if entry.get("status") == "FILLED":
+                        executed_qty = float(entry.get("executedQty", cycle.get("qty", 0.0)) or 0.0)
+                        if executed_qty <= 0:
+                            continue
+                        entry_price = float(entry.get("price") or cycle.get("entry_price", 0.0))
+                        if entry_price <= 0:
+                            entry_price = float(cycle.get("entry_price", 0.0))
+                        cycle["qty"] = executed_qty
+                        cycle["entry_price"] = entry_price
+                        cycle["state"] = "ENTRY_FILLED"
+                        cycle["updated_ts"] = time.time()
+                        self._append_log(f"[CYCLE] entry filled #{cycle_id} order={entry_order_id}")
+                        if cycle.get("exit_order_id"):
+                            continue
+                        tick_size = float(self.runtime.get("filters", {}).get("tickSize", 0.0001) or 0.0001)
+                        target_ticks = int(cycle.get("target_ticks", 1) or 1)
+                        delta = tick_size * max(1, target_ticks)
+                        exit_side = cycle.get("exit_side", "SELL" if cycle.get("entry_side") == "BUY" else "BUY")
+                        if cycle.get("entry_side") == "BUY":
+                            exit_price = self._round_down(entry_price + delta, tick_size)
+                            exit_resp = self.client.place_limit_sell("EURIUSDT", executed_qty, exit_price)
+                        else:
+                            exit_price = max(tick_size, self._round_down(entry_price - delta, tick_size))
+                            exit_resp = self.client.place_limit_buy("EURIUSDT", executed_qty, exit_price)
+                        exit_order_id = exit_resp.get("orderId")
+                        cycle["exit_order_id"] = exit_order_id
+                        cycle["exit_side"] = exit_side
+                        cycle["exit_price"] = exit_price
+                        cycle["state"] = "EXIT_PENDING"
+                        cycle["updated_ts"] = time.time()
+                        self.runtime.setdefault("order_to_cycle", {})[str(exit_order_id)] = cycle_id
+                        self._append_log(f"[CYCLE] exit limit placed #{cycle_id} order={exit_order_id} side={exit_side} price={exit_price:.8f} qty={executed_qty:.8f}")
+                        self._refresh_balances_only()
+                elif state == "EXIT_PENDING":
+                    exit_order_id = cycle.get("exit_order_id")
+                    if not exit_order_id:
+                        continue
+                    exit_order = self.client.get_order("EURIUSDT", int(exit_order_id))
+                    if exit_order.get("status") == "FILLED":
+                        exit_qty = float(exit_order.get("executedQty", cycle.get("qty", 0.0)) or 0.0)
+                        exit_price = float(exit_order.get("price") or cycle.get("exit_price", 0.0))
+                        entry_qty = float(cycle.get("qty", 0.0))
+                        entry_price = float(cycle.get("entry_price", 0.0))
+                        qty = min(entry_qty, exit_qty) if exit_qty > 0 else entry_qty
+                        sell_value = 0.0
+                        buy_value = 0.0
+                        if cycle.get("entry_side") == "BUY":
+                            buy_value = entry_price * qty
+                            sell_value = exit_price * qty
+                        else:
+                            sell_value = entry_price * qty
+                            buy_value = exit_price * qty
+                        pnl = sell_value - buy_value
+                        cycle["state"] = "COMPLETED"
+                        cycle["completed_ts"] = time.time()
+                        cycle["updated_ts"] = time.time()
+                        cycle["realized_pnl"] = pnl
+                        self.runtime["realized_pnl"] = float(self.runtime.get("realized_pnl", 0.0)) + pnl
+                        tick_size = float(self.runtime.get("filters", {}).get("tickSize", 0.0001) or 0.0001)
+                        captured_ticks = int(round((float(cycle.get("exit_price", 0.0)) - float(cycle.get("entry_price", 0.0))) / tick_size))
+                        if cycle.get("entry_side") == "SELL":
+                            captured_ticks *= -1
+                        self.runtime["tick_capture"] = int(self.runtime.get("tick_capture", 0)) + captured_ticks
+                        stats = self.runtime.setdefault("cycle_stats", {"total": 0, "wins": 0, "losses": 0, "completed": 0})
+                        stats["completed"] = int(stats.get("completed", 0)) + 1
+                        if pnl >= 0:
+                            stats["wins"] = int(stats.get("wins", 0)) + 1
+                        else:
+                            stats["losses"] = int(stats.get("losses", 0)) + 1
+                        self._append_log(f"[CYCLE] completed #{cycle_id} pnl={pnl:.8f}")
+                        self._refresh_balances_only()
+            except Exception as exc:
+                self._append_log(f"[CYCLE] sync error #{cycle_id}: {exc}")
+        self._refresh_open_orders()
 
     def _show_all_data(self):
         AllDataDialog(self).exec()
