@@ -65,6 +65,15 @@ DEFAULT_SETTINGS = {
     "regime_activation_delay_sec": 6.0,
     "regime_cooldown_sec": 5.0,
     "regime_confidence_jump_log": 12,
+    "paper_start_euri": 1000.0,
+    "paper_start_usdt": 1000.0,
+    "paper_order_size_euri": 50.0,
+    "paper_dangerous_skew_pct": 35.0,
+    "paper_critical_skew_pct": 55.0,
+    "paper_max_hold_sec": 45.0,
+    "paper_cancel_if_gap_gone_ticks": 0.6,
+    "paper_min_passive_viability": 65,
+    "paper_min_trap_survivability": 65,
 }
 
 
@@ -91,6 +100,17 @@ class Regime(str, Enum):
     CAUTION = "CAUTION"
     DANGEROUS = "DANGEROUS"
     ESCAPE = "ESCAPE"
+
+
+
+class PaperPositionState(str, Enum):
+    FLAT = "FLAT"
+    PASSIVE_BUY = "PASSIVE_BUY"
+    PASSIVE_SELL = "PASSIVE_SELL"
+    BUY_TRAP_ACTIVE = "BUY_TRAP_ACTIVE"
+    SELL_TRAP_ACTIVE = "SELL_TRAP_ACTIVE"
+    WAIT_EXIT = "WAIT_EXIT"
+    ESCAPE_UNLOAD = "ESCAPE_UNLOAD"
 
 class BasicSettingsDialog(QDialog):
     def __init__(self, settings: dict[str, Any], parent: QWidget | None = None) -> None:
@@ -254,6 +274,25 @@ class LUCWindow(QMainWindow):
         self.stop_ws = threading.Event()
         self.ws_thread: threading.Thread | None = None
 
+        self.paper_state = PaperPositionState.FLAT
+        self.paper_euri = float(self.settings.get("paper_start_euri", 1000.0))
+        self.paper_usdt = float(self.settings.get("paper_start_usdt", 1000.0))
+        self.paper_realized_pnl = 0.0
+        self.paper_entry_price = 0.0
+        self.paper_entry_ts = 0.0
+        self.paper_cycle_side = "NONE"
+        self.paper_pending_exit_price = 0.0
+        self.paper_trapped_euri = 0.0
+        self.paper_cycles = 0
+        self.paper_wins = 0
+        self.paper_losses = 0
+        self.paper_total_ticks = 0.0
+        self.paper_total_hold_sec = 0.0
+        self.paper_trap_attempts = 0
+        self.paper_trap_success = 0
+        self.paper_last_cycle = "-"
+        self._paper_last_log: dict[str, float] = {}
+
         self.setup_logger()
         self.build_ui()
         self.apply_theme()
@@ -310,11 +349,13 @@ class LUCWindow(QMainWindow):
             "EUR fair-value", "EURI mid", "fair gap", "fair gap ticks",
             "corridor age", "corridor stability", "refill/churn",
         ])
-        self.inventory_labels = self.make_panel(grid, 1, 0, "Inventory (demo)", [
-            "EURI balance", "USDT balance", "total value", "inventory skew",
+        self.inventory_labels = self.make_panel(grid, 1, 0, "Virtual Inventory", [
+            "EURI balance", "USDT balance", "total value", "inventory skew", "trapped inventory",
+            "realized pnl", "unrealized pnl",
         ])
-        self.session_labels = self.make_panel(grid, 1, 1, "Session (demo)", [
-            "cycles", "wins", "losses", "pnl", "ticks harvested",
+        self.session_labels = self.make_panel(grid, 1, 1, "Paper Engine", [
+            "paper state", "active cycle", "cycles", "wins", "losses", "realized pnl", "unrealized pnl",
+            "avg recycle ticks", "avg hold time", "trap success",
         ])
         self.state_labels = self.make_panel(grid, 2, 0, "Market State", [
             "current state", "corridor state", "trap readiness", "parent state", "stale state",
@@ -560,6 +601,135 @@ class LUCWindow(QMainWindow):
             self._last_micro_log[key] = message
             self.log(f"[MICRO] {message}")
 
+
+    def _paper_log(self, key: str, message: str, cooldown_sec: float = 4.0) -> None:
+        now = time.time()
+        if now - self._paper_last_log.get(key, 0.0) >= cooldown_sec:
+            self._paper_last_log[key] = now
+            self.log(message)
+
+    def _inventory_metrics(self, mark_price: float) -> tuple[float, float, float, float]:
+        total_value = self.paper_usdt + self.paper_euri * mark_price
+        skew = 0.0 if total_value <= 0 else ((self.paper_euri * mark_price) - self.paper_usdt) / total_value * 100
+        start_value = float(self.settings.get("paper_start_usdt", 1000.0)) + float(self.settings.get("paper_start_euri", 1000.0)) * mark_price
+        unrealized = 0.0
+        if self.paper_entry_price > 0 and self.paper_cycle_side in {"LONG", "SHORT"}:
+            direction = 1 if self.paper_cycle_side == "LONG" else -1
+            unrealized = (mark_price - self.paper_entry_price) * self.paper_trapped_euri * direction
+        return total_value, skew, start_value, unrealized
+
+    def _paper_step(self, *, now_ts: float, child_mid: float, gap_ticks: float, spread_ticks: float, parent_dir: str, regime: Regime, passive_viability: int, trap_survivability: int) -> None:
+        if child_mid <= 0:
+            return
+        qty = float(self.settings.get("paper_order_size_euri", self.settings.get("order_size", 50.0)))
+        min_gap_ticks = float(self.settings.get("min_gap_ticks", 2))
+        max_spread_ticks = float(self.settings.get("max_spread_ticks", 3))
+        cancel_gap = float(self.settings.get("paper_cancel_if_gap_gone_ticks", 0.6))
+        max_hold_sec = float(self.settings.get("paper_max_hold_sec", 45.0))
+        danger_skew = float(self.settings.get("paper_dangerous_skew_pct", 35.0))
+        critical_skew = float(self.settings.get("paper_critical_skew_pct", 55.0))
+        total_value, skew, _, unrealized = self._inventory_metrics(child_mid)
+
+        if abs(skew) >= danger_skew and self.paper_state == PaperPositionState.FLAT:
+            self._paper_log("skew", "[PAPER] skew danger")
+        if abs(skew) >= critical_skew and self.paper_state != PaperPositionState.FLAT:
+            self.paper_state = PaperPositionState.ESCAPE_UNLOAD
+
+        if self.paper_state in {PaperPositionState.BUY_TRAP_ACTIVE, PaperPositionState.PASSIVE_BUY} and (self.child_ask >= self.paper_pending_exit_price > 0):
+            pnl = (self.paper_pending_exit_price - self.paper_entry_price) * self.paper_trapped_euri
+            ticks = (self.paper_pending_exit_price - self.paper_entry_price) / float(self.settings.get("tick_size", 0.0001))
+            self.paper_usdt += self.paper_pending_exit_price * self.paper_trapped_euri
+            self.paper_euri -= self.paper_trapped_euri
+            self.paper_realized_pnl += pnl
+            self.paper_cycles += 1
+            self.paper_wins += 1 if pnl >= 0 else 0
+            self.paper_losses += 1 if pnl < 0 else 0
+            self.paper_total_ticks += ticks
+            self.paper_total_hold_sec += max(0.0, now_ts - self.paper_entry_ts)
+            if self.paper_state == PaperPositionState.BUY_TRAP_ACTIVE:
+                self.paper_trap_success += 1
+                self._paper_log("trap", "[PAPER] trap survived")
+            self.paper_last_cycle = f"LONG {ticks:+.2f}t pnl={pnl:+.4f}"
+            self.paper_state = PaperPositionState.FLAT
+            self.paper_cycle_side = "NONE"
+            self.paper_trapped_euri = 0.0
+            self._paper_log("recycle", f"[PAPER] recycle completed {ticks:+.2f} tick")
+            self._paper_log("close", f"[PAPER] cycle closed pnl={pnl:+.4f}")
+
+        if self.paper_state in {PaperPositionState.SELL_TRAP_ACTIVE, PaperPositionState.PASSIVE_SELL} and (self.child_bid <= self.paper_pending_exit_price < 10):
+            pnl = (self.paper_entry_price - self.paper_pending_exit_price) * self.paper_trapped_euri
+            ticks = (self.paper_entry_price - self.paper_pending_exit_price) / float(self.settings.get("tick_size", 0.0001))
+            self.paper_usdt -= self.paper_pending_exit_price * self.paper_trapped_euri
+            self.paper_euri += self.paper_trapped_euri
+            self.paper_realized_pnl += pnl
+            self.paper_cycles += 1
+            self.paper_wins += 1 if pnl >= 0 else 0
+            self.paper_losses += 1 if pnl < 0 else 0
+            self.paper_total_ticks += ticks
+            self.paper_total_hold_sec += max(0.0, now_ts - self.paper_entry_ts)
+            if self.paper_state == PaperPositionState.SELL_TRAP_ACTIVE:
+                self.paper_trap_success += 1
+                self._paper_log("trap", "[PAPER] trap survived")
+            self.paper_last_cycle = f"SHORT {ticks:+.2f}t pnl={pnl:+.4f}"
+            self.paper_state = PaperPositionState.FLAT
+            self.paper_cycle_side = "NONE"
+            self.paper_trapped_euri = 0.0
+            self._paper_log("recycle", f"[PAPER] recycle completed {ticks:+.2f} tick")
+            self._paper_log("close", f"[PAPER] cycle closed pnl={pnl:+.4f}")
+
+        if self.paper_state in {PaperPositionState.BUY_TRAP_ACTIVE, PaperPositionState.SELL_TRAP_ACTIVE} and (abs(gap_ticks) < cancel_gap or now_ts - self.paper_entry_ts > max_hold_sec or regime in {Regime.DANGEROUS, Regime.ESCAPE}):
+            self._paper_log("unload", "[PAPER] virtual unload")
+            self.paper_state = PaperPositionState.WAIT_EXIT
+
+        if self.paper_state == PaperPositionState.WAIT_EXIT:
+            self.paper_pending_exit_price = child_mid
+
+        if self.paper_state != PaperPositionState.FLAT:
+            return
+        if regime in {Regime.DANGEROUS, Regime.ESCAPE, Regime.CAUTION} or abs(skew) >= critical_skew:
+            return
+        if spread_ticks > max_spread_ticks:
+            return
+
+        tick = float(self.settings.get("tick_size", 0.0001))
+        min_passive = int(self.settings.get("paper_min_passive_viability", 65))
+        min_trap = int(self.settings.get("paper_min_trap_survivability", 65))
+
+        if regime == Regime.IDEAL_PASSIVE and passive_viability >= min_passive and abs(skew) < danger_skew:
+            if self.paper_usdt >= qty * self.child_bid:
+                self.paper_entry_price = self.child_bid
+                self.paper_usdt -= qty * self.paper_entry_price
+                self.paper_euri += qty
+                self.paper_pending_exit_price = self.child_ask
+                self.paper_entry_ts = now_ts
+                self.paper_trapped_euri = qty
+                self.paper_cycle_side = "LONG"
+                self.paper_state = PaperPositionState.PASSIVE_BUY
+        elif regime == Regime.IDEAL_TRAP and trap_survivability >= min_trap and gap_ticks >= min_gap_ticks and parent_dir == "UP":
+            if self.paper_usdt >= qty * self.child_ask:
+                self.paper_entry_price = self.child_ask
+                self.paper_usdt -= qty * self.paper_entry_price
+                self.paper_euri += qty
+                self.paper_pending_exit_price = self.paper_entry_price + tick
+                self.paper_entry_ts = now_ts
+                self.paper_trapped_euri = qty
+                self.paper_cycle_side = "LONG"
+                self.paper_state = PaperPositionState.BUY_TRAP_ACTIVE
+                self.paper_trap_attempts += 1
+                self._paper_log("open_buy", "[PAPER] BUY_TRAP opened")
+        elif regime == Regime.IDEAL_TRAP and trap_survivability >= min_trap and gap_ticks <= -min_gap_ticks and parent_dir == "DOWN":
+            if self.paper_euri >= qty:
+                self.paper_entry_price = self.child_bid
+                self.paper_euri -= qty
+                self.paper_usdt += qty * self.paper_entry_price
+                self.paper_pending_exit_price = self.paper_entry_price - tick
+                self.paper_entry_ts = now_ts
+                self.paper_trapped_euri = qty
+                self.paper_cycle_side = "SHORT"
+                self.paper_state = PaperPositionState.SELL_TRAP_ACTIVE
+                self.paper_trap_attempts += 1
+                self._paper_log("open_sell", "[PAPER] SELL_TRAP opened")
+
     def refresh_view(self) -> None:
         parent_mid = (self.parent_bid + self.parent_ask) / 2 if self.parent_bid and self.parent_ask else 0.0
         child_mid = (self.child_bid + self.child_ask) / 2 if self.child_bid and self.child_ask else 0.0
@@ -693,6 +863,8 @@ class LUCWindow(QMainWindow):
         self._regime_confidence = max(0, min(100, int(regime_score * 0.45 + metric_agreement * 0.30 + duration_bonus * 0.15 + regime_stability * 0.10)))
         self._update_regime(regime_candidate, regime_score, now_ts, regime_stability)
 
+        self._paper_step(now_ts=now_ts, child_mid=child_mid, gap_ticks=gap_ticks, spread_ticks=spread_ticks, parent_dir=parent_dir, regime=self.current_regime, passive_viability=passive_viability, trap_survivability=trap_survivability)
+
         self._state_duration = self._state_duration + 1 if state == self.current_state else 1
         self.state_age_hist.append(self._state_duration)
 
@@ -759,16 +931,29 @@ class LUCWindow(QMainWindow):
         self._set_regime_label("transition cooldown", f"{cooldown_left:.1f}s", self.current_regime)
         self._set_regime_label("regime stability", f"{regime_stability} ({transition_quality})", self.current_regime)
 
-        self.inventory_labels["EURI balance"].setText("1000.00")
-        self.inventory_labels["USDT balance"].setText("1000.00")
-        self.inventory_labels["total value"].setText("2000.00")
-        self.inventory_labels["inventory skew"].setText("0.00%")
+        total_value, skew, _, unrealized = self._inventory_metrics(child_mid)
+        avg_ticks = self.paper_total_ticks / self.paper_cycles if self.paper_cycles else 0.0
+        avg_hold = self.paper_total_hold_sec / self.paper_cycles if self.paper_cycles else 0.0
+        trap_success = (self.paper_trap_success / self.paper_trap_attempts * 100.0) if self.paper_trap_attempts else 0.0
 
-        self.session_labels["cycles"].setText("0")
-        self.session_labels["wins"].setText("0")
-        self.session_labels["losses"].setText("0")
-        self.session_labels["pnl"].setText("0.00")
-        self.session_labels["ticks harvested"].setText("0")
+        self.inventory_labels["EURI balance"].setText(f"{self.paper_euri:.2f}")
+        self.inventory_labels["USDT balance"].setText(f"{self.paper_usdt:.2f}")
+        self.inventory_labels["total value"].setText(f"{total_value:.2f}")
+        self.inventory_labels["inventory skew"].setText(f"{skew:+.2f}%")
+        self.inventory_labels["trapped inventory"].setText(f"{self.paper_trapped_euri:.2f}")
+        self.inventory_labels["realized pnl"].setText(f"{self.paper_realized_pnl:+.4f}")
+        self.inventory_labels["unrealized pnl"].setText(f"{unrealized:+.4f}")
+
+        self.session_labels["paper state"].setText(self.paper_state.value)
+        self.session_labels["active cycle"].setText(self.paper_last_cycle)
+        self.session_labels["cycles"].setText(str(self.paper_cycles))
+        self.session_labels["wins"].setText(str(self.paper_wins))
+        self.session_labels["losses"].setText(str(self.paper_losses))
+        self.session_labels["realized pnl"].setText(f"{self.paper_realized_pnl:+.4f}")
+        self.session_labels["unrealized pnl"].setText(f"{unrealized:+.4f}")
+        self.session_labels["avg recycle ticks"].setText(f"{avg_ticks:+.2f}")
+        self.session_labels["avg hold time"].setText(f"{avg_hold:.1f}s")
+        self.session_labels["trap success"].setText(f"{trap_success:.1f}%")
 
     def log(self, message: str) -> None:
         ts = datetime.now().strftime("%H:%M:%S")
