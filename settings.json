@@ -24,5 +24,10 @@
   "paper_dangerous_skew_pct": 35.0,
   "paper_critical_skew_pct": 55.0,
   "paper_max_open_cycles": 1,
-  "paper_max_cycles_per_min": 8
+  "paper_max_cycles_per_min": 8,
+  "live_test_order_size_euri": 1.0,
+  "live_test_max_orders": 5,
+  "live_test_max_notional_usdt": 100.0,
+  "live_test_price_offset_ticks": 1,
+  "live_test_armed": false
 }

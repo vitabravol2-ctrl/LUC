@@ -5,6 +5,9 @@ import sys
 import threading
 import time
 import random
+import hmac
+import hashlib
+from urllib.parse import urlencode
 from collections import deque
 from enum import Enum
 from datetime import datetime
@@ -88,6 +91,11 @@ DEFAULT_SETTINGS = {
     "sizing_max_order_size": 200.0,
     "sizing_randomize": True,
     "sizing_random_factor_pct": 20.0,
+    "live_test_order_size_euri": 1.0,
+    "live_test_max_orders": 5,
+    "live_test_max_notional_usdt": 100.0,
+    "live_test_price_offset_ticks": 1,
+    "live_test_armed": False,
 }
 
 
@@ -294,6 +302,15 @@ class LUCWindow(QMainWindow):
         self.resize(1280, 840)
 
         self.settings = self.load_settings()
+        self.api_key, self.api_secret = self.load_api_keys()
+        self.api_status = "NO_KEYS" if not (self.api_key and self.api_secret) else "READY"
+        self.account_status = "IDLE"
+        self.api_euri_balance = 0.0
+        self.api_usdt_balance = 0.0
+        self.api_open_orders_count = 0
+        self.last_order_status = "-"
+        self.test_orders: dict[str, dict[str, Any]] = {}
+        self.test_order_events: deque[str] = deque(maxlen=5)
 
         self.parent_bid = 0.0
         self.parent_ask = 0.0
@@ -424,19 +441,27 @@ class LUCWindow(QMainWindow):
         layout = QVBoxLayout(root)
 
         top = QHBoxLayout()
-        self.start_btn = QPushButton("START")
-        self.stop_btn = QPushButton("STOP")
+        self.toggle_btn = QPushButton("START")
         self.reset_btn = QPushButton("RESET PAPER")
         self.settings_btn = QPushButton("SETTINGS")
         self.full_json_btn = QPushButton("FULL JSON")
-        self.start_btn.clicked.connect(self.start_paper_engine)
-        self.stop_btn.clicked.connect(self.stop_paper_engine)
+        self.toggle_btn.clicked.connect(self.toggle_paper_engine)
         self.reset_btn.clicked.connect(self.reset_paper_engine)
         self.settings_btn.clicked.connect(self.open_basic_settings)
         self.full_json_btn.clicked.connect(self.open_json_settings)
-        for btn in (self.start_btn, self.stop_btn, self.reset_btn, self.settings_btn, self.full_json_btn):
+        for btn in (self.toggle_btn, self.reset_btn, self.settings_btn, self.full_json_btn):
             btn.setMinimumHeight(34)
             top.addWidget(btn)
+        self.arm_test_checkbox = QCheckBox("ARM TEST")
+        self.arm_test_checkbox.setChecked(bool(self.settings.get("live_test_armed", False)))
+        self.arm_test_checkbox.stateChanged.connect(self.on_arm_test_changed)
+        self.test_orders_btn = QPushButton("TEST 5 ORDERS")
+        self.test_orders_btn.clicked.connect(self.send_test_orders)
+        self.cancel_test_btn = QPushButton("CANCEL TEST ORDERS")
+        self.cancel_test_btn.clicked.connect(self.cancel_test_orders)
+        top.addWidget(self.arm_test_checkbox)
+        top.addWidget(self.test_orders_btn)
+        top.addWidget(self.cancel_test_btn)
         self.lbl_app = QLabel()
         self.lbl_ws = QLabel()
         self.lbl_http = QLabel()
@@ -470,6 +495,11 @@ class LUCWindow(QMainWindow):
         self.ledger_labels = self.make_panel(grid, 3, 1, "LEDGER LAST EVENTS", [
             "event 1", "event 2", "event 3", "event 4", "event 5",
         ])
+        self.api_labels = self.make_panel(grid, 3, 0, "REAL API TEST", [
+            "api status", "account status", "EURI balance", "USDT balance", "open orders", "last order status",
+            "order 1", "order 2", "order 3", "order 4", "order 5",
+            "event 1", "event 2", "event 3", "event 4", "event 5",
+        ])
         layout.addLayout(grid)
         self.log_box = QPlainTextEdit()
         self.log_box.setReadOnly(True)
@@ -484,19 +514,19 @@ class LUCWindow(QMainWindow):
         grid.setRowStretch(3, 2)
         grid.setRowStretch(4, 0)
 
-    def start_paper_engine(self) -> None:
+    def toggle_paper_engine(self) -> None:
         if self.paper_engine_enabled:
+            self.paper_engine_enabled = False
+            self.mode = "STOPPED"
+            self.paper_entry_block_reason = "STOPPED"
+            self.toggle_btn.setText("START")
+            self.log("[CONTROL] paper engine STOP (no new entries)")
             return
         self.paper_engine_enabled = True
         self.mode = "PAPER"
         self.paper_entry_block_reason = "waiting_new_snapshot"
+        self.toggle_btn.setText("STOP")
         self.log("[CONTROL] paper engine START")
-
-    def stop_paper_engine(self) -> None:
-        self.paper_engine_enabled = False
-        self.mode = "STOPPED"
-        self.paper_entry_block_reason = "STOPPED"
-        self.log("[CONTROL] paper engine STOP (no new entries)")
 
     def reset_paper_engine(self) -> None:
         self.paper_state = PaperPositionState.FLAT
@@ -766,6 +796,103 @@ class LUCWindow(QMainWindow):
         if now - self._last_warn_log.get(key, 0.0) >= cooldown_sec:
             self._last_warn_log[key] = now
             self.log(message)
+
+    def load_api_keys(self) -> tuple[str, str]:
+        env_key = os.getenv("BINANCE_API_KEY", "")
+        env_secret = os.getenv("BINANCE_API_SECRET", "")
+        cfg_key = str(self.settings.get("api_key", ""))
+        cfg_secret = str(self.settings.get("api_secret", ""))
+        return (env_key or cfg_key).strip(), (env_secret or cfg_secret).strip()
+
+    def on_arm_test_changed(self) -> None:
+        self.settings["live_test_armed"] = self.arm_test_checkbox.isChecked()
+        self.save_settings()
+
+    def _binance_signed(self, method: str, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        if not (self.api_key and self.api_secret):
+            self.api_status = "NO_KEYS"
+            raise RuntimeError("No API keys")
+        payload = dict(params or {})
+        payload["timestamp"] = int(time.time() * 1000)
+        payload["recvWindow"] = 5000
+        query = urlencode(payload)
+        signature = hmac.new(self.api_secret.encode("utf-8"), query.encode("utf-8"), hashlib.sha256).hexdigest()
+        url = f"https://api.binance.com{path}?{query}&signature={signature}"
+        resp = requests.request(method, url, headers={"X-MBX-APIKEY": self.api_key}, timeout=8)
+        data = resp.json()
+        if resp.status_code >= 400:
+            raise RuntimeError(str(data))
+        self.api_status = "CONNECTED"
+        return data
+
+    def refresh_api_panel(self) -> None:
+        if not (self.api_key and self.api_secret):
+            self.api_status = "NO_KEYS"
+            self.account_status = "NO_KEYS"
+            return
+        try:
+            acc = self._binance_signed("GET", "/api/v3/account")
+            self.account_status = str(acc.get("accountType", "OK"))
+            balances = {b.get("asset"): float(b.get("free", 0.0)) for b in acc.get("balances", [])}
+            self.api_euri_balance = balances.get("EURI", 0.0)
+            self.api_usdt_balance = balances.get("USDT", 0.0)
+            oo = self._binance_signed("GET", "/api/v3/openOrders", {"symbol": "EURIUSDT"})
+            self.api_open_orders_count = len(oo)
+        except Exception as exc:
+            self.api_status = "ERROR"
+            self.account_status = "ERROR"
+            self.log(f"[ERROR] api rejected {exc}")
+
+    def send_test_orders(self) -> None:
+        if not self.arm_test_checkbox.isChecked():
+            self.log("[TEST] ARM TEST is false")
+            return
+        max_orders = min(5, int(self.settings.get("live_test_max_orders", 5)))
+        qty = float(self.settings.get("live_test_order_size_euri", 1.0))
+        max_notional = float(self.settings.get("live_test_max_notional_usdt", 100.0))
+        offset_ticks = int(self.settings.get("live_test_price_offset_ticks", 1))
+        tick = float(self.settings.get("tick_size", 0.0001))
+        for i in range(max_orders):
+            price = max(tick, self.child_bid - tick * (offset_ticks + i))
+            if qty * price > max_notional:
+                break
+            cid = f"LUC_TEST_{int(time.time()*1000)}_{i}"
+            try:
+                result = self._binance_signed("POST", "/api/v3/order", {"symbol": "EURIUSDT", "side": "BUY", "type": "LIMIT", "timeInForce": "GTC", "quantity": f"{qty:.4f}", "price": f"{price:.6f}", "newClientOrderId": cid})
+                status = str(result.get("status", "NEW"))
+                self.test_orders[cid] = {"order_id": str(result.get("orderId", "-")), "side": "BUY", "qty": qty, "price": price, "status": status}
+                self.last_order_status = status
+                self.test_order_events.appendleft(f"{result.get('orderId','-')} BUY {qty:.4f} {price:.6f} {status}")
+                self.log("[TEST] order sent")
+            except Exception as exc:
+                self.log(f"[ERROR] api rejected {exc}")
+                break
+
+    def cancel_test_orders(self) -> None:
+        for cid, order in list(self.test_orders.items()):
+            if not cid.startswith("LUC_TEST_"):
+                continue
+            try:
+                self._binance_signed("DELETE", "/api/v3/order", {"symbol": "EURIUSDT", "origClientOrderId": cid})
+                order["status"] = "CANCELED"
+                self.last_order_status = "CANCELED"
+                self.test_order_events.appendleft(f"{order.get('order_id','-')} {order.get('side','BUY')} {order.get('qty',0.0):.4f} {order.get('price',0.0):.6f} CANCELED")
+                self.log("[TEST] order canceled")
+            except Exception as exc:
+                self.log(f"[ERROR] api rejected {exc}")
+
+    def poll_test_order_statuses(self) -> None:
+        for cid, order in list(self.test_orders.items()):
+            try:
+                result = self._binance_signed("GET", "/api/v3/order", {"symbol": "EURIUSDT", "origClientOrderId": cid})
+                status = str(result.get("status", order.get("status", "NEW")))
+                if status != order.get("status"):
+                    order["status"] = status
+                    self.last_order_status = status
+                    self.test_order_events.appendleft(f"{order.get('order_id','-')} {order.get('side','BUY')} {order.get('qty',0.0):.4f} {order.get('price',0.0):.6f} {status}")
+                    self.log("[TEST] order status")
+            except Exception:
+                continue
 
     def _inventory_metrics(self, mark_price: float) -> tuple[float, float, float, float]:
         total_value = self.paper_usdt + self.paper_euri * mark_price
@@ -1167,6 +1294,8 @@ class LUCWindow(QMainWindow):
             self._warn_once("accounting_mismatch", "[WARN] accounting mismatch")
 
     def refresh_view(self) -> None:
+        self.refresh_api_panel()
+        self.poll_test_order_statuses()
         parent_mid = (self.parent_bid + self.parent_ask) / 2 if self.parent_bid and self.parent_ask else 0.0
         child_mid = (self.child_bid + self.child_ask) / 2 if self.child_bid and self.child_ask else 0.0
         spread = self.child_ask - self.child_bid if self.child_bid and self.child_ask else 0.0
@@ -1364,6 +1493,23 @@ class LUCWindow(QMainWindow):
         self.inventory_labels["open lots"].setText(str(len(self.paper_lots)))
 
         self.engine_labels["engine status"].setText("STARTED" if self.paper_engine_enabled else "STOPPED")
+        self.api_labels["api status"].setText(self.api_status)
+        self.api_labels["account status"].setText(self.account_status)
+        self.api_labels["EURI balance"].setText(f"{self.api_euri_balance:.4f}")
+        self.api_labels["USDT balance"].setText(f"{self.api_usdt_balance:.4f}")
+        self.api_labels["open orders"].setText(str(self.api_open_orders_count))
+        self.api_labels["last order status"].setText(self.last_order_status)
+        orders = list(self.test_orders.values())
+        for i in range(5):
+            key = f"order {i+1}"
+            if i < len(orders):
+                o = orders[i]
+                self.api_labels[key].setText(f"{o['order_id']} {o['side']} {o['qty']:.4f} {o['price']:.6f} {o['status']}")
+            else:
+                self.api_labels[key].setText("-")
+        events = list(self.test_order_events)
+        for i in range(5):
+            self.api_labels[f"event {i+1}"].setText(events[i] if i < len(events) else "-")
         self.engine_labels["paper state"].setText(self.paper_state.value)
         self.engine_labels["active cycle"].setText(f"{self.paper_last_cycle} [{self.paper_cycle_source}]")
         self.session_labels["cycles"].setText(str(self.paper_cycles))
