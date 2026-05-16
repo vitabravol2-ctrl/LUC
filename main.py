@@ -75,6 +75,9 @@ DEFAULT_SETTINGS = {
     "paper_min_passive_viability": 65,
     "paper_min_trap_survivability": 65,
     "paper_max_open_cycles": 1,
+    "paper_min_hold_sec": 4.0,
+    "paper_cycle_cooldown_sec": 7.0,
+    "paper_max_cycles_per_min": 8,
 }
 
 
@@ -319,6 +322,16 @@ class LUCWindow(QMainWindow):
         self.paper_passive_gate = 0
         self.paper_cycle_source = "NONE"
         self.paper_max_open_cycles = max(1, int(self.settings.get("paper_max_open_cycles", 1)))
+        self.euri_snapshot_id = 0
+        self.last_entry_snapshot_id = -1
+        self.last_exit_snapshot_id = -1
+        self.paper_cycle_entry_snapshot_id = -1
+        self.paper_cycle_snapshots = 0
+        self.paper_last_close_ts = 0.0
+        self.paper_fill_delay_left = 0
+        self.paper_overtrade_block_until = 0.0
+        self.paper_fill_quality = 0
+        self.paper_cycle_timestamps: deque[float] = deque(maxlen=120)
         self._last_warn_log: dict[str, float] = {}
 
         self.setup_logger()
@@ -386,6 +399,8 @@ class LUCWindow(QMainWindow):
         self.session_labels = self.make_panel(grid, 1, 1, "Paper Engine", [
             "paper state", "active cycle", "cycles", "wins", "losses", "realized pnl", "unrealized pnl",
             "avg recycle ticks", "avg hold time", "trap success", "cycle lifecycle", "active lot age", "max adverse excursion", "partial recycle",
+            "fill quality", "entry snapshot age", "cooldown remaining", "min hold remaining", "snapshots in cycle",
+            "cycles/min", "last entry snapshot", "last exit snapshot",
         ])
         self.state_labels = self.make_panel(grid, 2, 0, "Market State", [
             "current state", "corridor state", "trap readiness", "parent state", "stale state",
@@ -520,6 +535,9 @@ class LUCWindow(QMainWindow):
             payload = resp.json()
             self.child_bid = float(payload.get("bidPrice", 0.0))
             self.child_ask = float(payload.get("askPrice", 0.0))
+            self.euri_snapshot_id += 1
+            if self.paper_state != PaperPositionState.FLAT and self.paper_cycle_entry_snapshot_id >= 0:
+                self.paper_cycle_snapshots = max(1, self.euri_snapshot_id - self.paper_cycle_entry_snapshot_id + 1)
             self.http_status = "OK"
             self.last_child_update_ts = time.time()
         except Exception as exc:
@@ -684,7 +702,34 @@ class LUCWindow(QMainWindow):
         return True
 
     def _can_open_new_cycle(self) -> bool:
-        return self.paper_state == PaperPositionState.FLAT and len(self.paper_lots) < self.paper_max_open_cycles
+        if not (self.paper_state == PaperPositionState.FLAT and len(self.paper_lots) < self.paper_max_open_cycles):
+            return False
+        if self.euri_snapshot_id <= self.last_entry_snapshot_id:
+            self._paper_log("entry_same_snapshot", "[PAPER] entry blocked same_snapshot")
+            return False
+        now_ts = time.time()
+        cooldown_sec = float(self.settings.get("paper_cycle_cooldown_sec", 7.0))
+        if now_ts < self.paper_last_close_ts + cooldown_sec:
+            self._paper_log("cooldown", "[PAPER] cooldown active")
+            return False
+        if now_ts < self.paper_overtrade_block_until:
+            self._paper_log("overtrade", "[WARN] paper overtrade guard active")
+            return False
+        return True
+
+    def _paper_fill_delay_snapshots(self, spread_ticks: float, passive_viability: int, refill_strength: str, churn_quality: str, is_fresh: bool) -> int:
+        if refill_strength == "AGGRESSIVE_REFILL":
+            return -1
+        if spread_ticks > float(self.settings.get("max_spread_ticks", 3)):
+            return -1
+        delay = 2
+        if spread_ticks <= 1.2 and passive_viability >= 85 and churn_quality in {"CALM", "NORMAL"} and refill_strength == "WEAK_REFILL" and is_fresh:
+            delay = 1
+        elif passive_viability < 70 or churn_quality == "CHAOTIC" or not is_fresh:
+            delay = 3
+        if spread_ticks > 2.2:
+            delay += 1
+        return max(1, min(4, delay))
 
     def _close_lots(self, *, side: str, qty: float, price: float, now_ts: float, event_type: str) -> tuple[float, float]:
         if qty <= 1e-9:
@@ -750,10 +795,15 @@ class LUCWindow(QMainWindow):
         self.paper_trapped_euri = 0.0
         self.paper_entry_ts = 0.0
         self.paper_cycle_partial = "NONE"
+        self.last_exit_snapshot_id = self.euri_snapshot_id
+        self.paper_last_close_ts = now_ts
+        self.paper_cycle_timestamps.append(now_ts)
+        self.paper_cycle_entry_snapshot_id = -1
+        self.paper_cycle_snapshots = 0
         self.log(f"[PAPER] close {source_name} {close_side} qty={closed_qty:.2f} price={close_price:.4f} pnl={pnl:+.4f}")
         self._paper_log("recycle", f"[PAPER] cycle closed pnl={pnl:+.4f} ticks={ticks:+.2f}")
 
-    def _paper_step(self, *, now_ts: float, child_mid: float, gap_ticks: float, spread_ticks: float, parent_dir: str, regime: Regime, passive_viability: int, trap_survivability: int) -> None:
+    def _paper_step(self, *, now_ts: float, child_mid: float, gap_ticks: float, spread_ticks: float, parent_dir: str, regime: Regime, passive_viability: int, trap_survivability: int, refill_strength: str, churn_quality: str, child_stale_sec: float) -> None:
         if child_mid <= 0:
             return
         qty = float(self.settings.get("paper_order_size_euri", self.settings.get("order_size", 50.0)))
@@ -761,23 +811,51 @@ class LUCWindow(QMainWindow):
         max_spread_ticks = float(self.settings.get("max_spread_ticks", 3))
         cancel_gap = float(self.settings.get("paper_cancel_if_gap_gone_ticks", 0.6))
         max_hold_sec = float(self.settings.get("paper_max_hold_sec", 45.0))
+        min_hold_sec = float(self.settings.get("paper_min_hold_sec", 4.0))
         danger_skew = float(self.settings.get("paper_dangerous_skew_pct", 35.0))
         critical_skew = float(self.settings.get("paper_critical_skew_pct", 55.0))
+        max_cycles_per_min = int(self.settings.get("paper_max_cycles_per_min", 8))
         total_value, skew, start_value, unrealized = self._inventory_metrics(child_mid)
         self.paper_cycle_mae = min(self.paper_cycle_mae, unrealized)
+        self.paper_fill_quality = max(0, min(100, int(
+            (100 if child_stale_sec <= 2.5 else 45) * 0.25
+            + (100 if spread_ticks <= max_spread_ticks else 35) * 0.2
+            + passive_viability * 0.2
+            + (85 if refill_strength == "WEAK_REFILL" else 55 if refill_strength == "NORMAL_REFILL" else 20) * 0.2
+            + (95 if regime in {Regime.IDEAL_PASSIVE, Regime.IDEAL_TRAP, Regime.NEUTRAL} else 40) * 0.15
+        )))
+        while self.paper_cycle_timestamps and now_ts - self.paper_cycle_timestamps[0] > 60:
+            self.paper_cycle_timestamps.popleft()
+        if len(self.paper_cycle_timestamps) >= max_cycles_per_min:
+            self.paper_overtrade_block_until = max(self.paper_overtrade_block_until, now_ts + 10.0)
+            self._paper_log("overtrade", "[WARN] paper overtrade guard active", cooldown_sec=8.0)
 
         if abs(skew) >= danger_skew and self.paper_state == PaperPositionState.FLAT:
             self._paper_log("skew", "[PAPER] skew danger")
         if abs(skew) >= critical_skew and self.paper_state != PaperPositionState.FLAT:
             self.paper_state = PaperPositionState.ESCAPE_UNLOAD
 
+        hold_sec = now_ts - self.paper_entry_ts if self.paper_entry_ts else 0.0
+        can_exit_snapshot = self.euri_snapshot_id > self.paper_cycle_entry_snapshot_id and self.euri_snapshot_id > self.last_exit_snapshot_id
         if self.paper_state in {PaperPositionState.BUY_TRAP_ACTIVE, PaperPositionState.PASSIVE_BUY} and (self.child_ask >= self.paper_pending_exit_price > 0):
+            if not can_exit_snapshot:
+                return
+            if hold_sec < min_hold_sec:
+                self._paper_log("min_hold", "[PAPER] exit waiting min_hold")
+                return
             source_state = self.paper_state
             self._finalize_cycle_close(now_ts=now_ts, close_price=self.paper_pending_exit_price, side="BUY", source_state=source_state)
 
         if self.paper_state in {PaperPositionState.SELL_TRAP_ACTIVE, PaperPositionState.PASSIVE_SELL} and (self.child_bid <= self.paper_pending_exit_price < 10):
+            if not can_exit_snapshot:
+                return
+            if hold_sec < min_hold_sec:
+                self._paper_log("min_hold", "[PAPER] exit waiting min_hold")
+                return
             source_state = self.paper_state
             self._finalize_cycle_close(now_ts=now_ts, close_price=self.paper_pending_exit_price, side="SELL", source_state=source_state)
+        elif self.paper_state in {PaperPositionState.BUY_TRAP_ACTIVE, PaperPositionState.PASSIVE_BUY, PaperPositionState.SELL_TRAP_ACTIVE, PaperPositionState.PASSIVE_SELL}:
+            self._paper_log("price_touch", "[PAPER] exit waiting price_touch")
 
         if self.paper_state in {PaperPositionState.BUY_TRAP_ACTIVE, PaperPositionState.SELL_TRAP_ACTIVE} and (abs(gap_ticks) < cancel_gap or now_ts - self.paper_entry_ts > max_hold_sec or regime in {Regime.DANGEROUS, Regime.ESCAPE}):
             self._paper_log("unload", "[PAPER] virtual unload")
@@ -826,6 +904,13 @@ class LUCWindow(QMainWindow):
 
         if regime == Regime.IDEAL_PASSIVE and passive_viability >= min_passive and abs(skew) < danger_skew:
             if self.paper_usdt >= qty * self.child_bid and self._can_open_new_cycle():
+                fill_delay = self._paper_fill_delay_snapshots(spread_ticks, passive_viability, refill_strength, churn_quality, child_stale_sec <= 2.5)
+                if fill_delay < 0:
+                    return
+                self.paper_fill_delay_left = fill_delay
+                if self.paper_fill_delay_left > 1:
+                    self.paper_fill_delay_left -= 1
+                    return
                 self.paper_entry_price = self.child_bid
                 self.paper_usdt -= qty * self.paper_entry_price
                 self.paper_euri += qty
@@ -836,6 +921,9 @@ class LUCWindow(QMainWindow):
                 self.paper_state = PaperPositionState.PASSIVE_BUY
                 self.paper_cycle_state = CycleState.OPEN
                 self.paper_cycle_source = "PASSIVE"
+                self.last_entry_snapshot_id = self.euri_snapshot_id
+                self.paper_cycle_entry_snapshot_id = self.euri_snapshot_id
+                self.paper_cycle_snapshots = 1
                 if self._open_lot(side="BUY", qty=qty, price=self.paper_entry_price, now_ts=now_ts, source="PASSIVE"):
                     self.log(f"[PAPER] open PASSIVE BUY qty={qty:.2f} price={self.paper_entry_price:.4f}")
         elif regime == Regime.IDEAL_TRAP and trap_survivability >= min_trap and gap_ticks >= min_gap_ticks and parent_dir == "UP":
@@ -851,6 +939,9 @@ class LUCWindow(QMainWindow):
                 self.paper_cycle_state = CycleState.ACTIVE
                 self.paper_trap_attempts += 1
                 self.paper_cycle_source = "BUY_TRAP"
+                self.last_entry_snapshot_id = self.euri_snapshot_id
+                self.paper_cycle_entry_snapshot_id = self.euri_snapshot_id
+                self.paper_cycle_snapshots = 1
                 self._open_lot(side="BUY", qty=qty, price=self.paper_entry_price, now_ts=now_ts, source="BUY_TRAP")
                 self._paper_log("open_buy", "[PAPER] BUY_TRAP opened")
         elif regime == Regime.IDEAL_TRAP and trap_survivability >= min_trap and gap_ticks <= -min_gap_ticks and parent_dir == "DOWN":
@@ -866,6 +957,9 @@ class LUCWindow(QMainWindow):
                 self.paper_cycle_state = CycleState.ACTIVE
                 self.paper_trap_attempts += 1
                 self.paper_cycle_source = "SELL_TRAP"
+                self.last_entry_snapshot_id = self.euri_snapshot_id
+                self.paper_cycle_entry_snapshot_id = self.euri_snapshot_id
+                self.paper_cycle_snapshots = 1
                 self._open_lot(side="SELL", qty=qty, price=self.paper_entry_price, now_ts=now_ts, source="SELL_TRAP")
                 self._paper_log("open_sell", "[PAPER] SELL_TRAP opened")
         if abs((self.paper_realized_pnl + unrealized) - (total_value - start_value)) > 0.8:
@@ -1004,7 +1098,19 @@ class LUCWindow(QMainWindow):
         self._regime_confidence = max(0, min(100, int(regime_score * 0.45 + metric_agreement * 0.30 + duration_bonus * 0.15 + regime_stability * 0.10)))
         self._update_regime(regime_candidate, regime_score, now_ts, regime_stability)
 
-        self._paper_step(now_ts=now_ts, child_mid=child_mid, gap_ticks=gap_ticks, spread_ticks=spread_ticks, parent_dir=parent_dir, regime=self.current_regime, passive_viability=passive_viability, trap_survivability=trap_survivability)
+        self._paper_step(
+            now_ts=now_ts,
+            child_mid=child_mid,
+            gap_ticks=gap_ticks,
+            spread_ticks=spread_ticks,
+            parent_dir=parent_dir,
+            regime=self.current_regime,
+            passive_viability=passive_viability,
+            trap_survivability=trap_survivability,
+            refill_strength=refill_strength,
+            churn_quality=churn_quality,
+            child_stale_sec=child_stale_sec,
+        )
 
         self._state_duration = self._state_duration + 1 if state == self.current_state else 1
         self.state_age_hist.append(self._state_duration)
@@ -1103,6 +1209,18 @@ class LUCWindow(QMainWindow):
         self.session_labels["active lot age"].setText(f"{max(0.0, time.time() - self.paper_entry_ts):.1f}s" if self.paper_entry_ts else "0.0s")
         self.session_labels["max adverse excursion"].setText(f"{self.paper_cycle_mae:+.4f}")
         self.session_labels["partial recycle"].setText(self.paper_cycle_partial)
+        entry_age = max(0, self.euri_snapshot_id - self.last_entry_snapshot_id) if self.last_entry_snapshot_id >= 0 else 0
+        cool_left = max(0.0, (self.paper_last_close_ts + float(self.settings.get("paper_cycle_cooldown_sec", 7.0))) - now_ts)
+        hold_left = max(0.0, (self.paper_entry_ts + float(self.settings.get("paper_min_hold_sec", 4.0))) - now_ts) if self.paper_entry_ts else 0.0
+        cycles_min = len(self.paper_cycle_timestamps)
+        self.session_labels["fill quality"].setText(f"{self.paper_fill_quality}")
+        self.session_labels["entry snapshot age"].setText(str(entry_age))
+        self.session_labels["cooldown remaining"].setText(f"{cool_left:.1f}s")
+        self.session_labels["min hold remaining"].setText(f"{hold_left:.1f}s")
+        self.session_labels["snapshots in cycle"].setText(str(self.paper_cycle_snapshots))
+        self.session_labels["cycles/min"].setText(str(cycles_min))
+        self.session_labels["last entry snapshot"].setText(str(self.last_entry_snapshot_id))
+        self.session_labels["last exit snapshot"].setText(str(self.last_exit_snapshot_id))
         for idx, key in enumerate(["event 1", "event 2", "event 3", "event 4", "event 5", "event 6", "event 7", "event 8"]):
             if idx < len(self.paper_ledger):
                 evt = self.paper_ledger[idx]
