@@ -160,34 +160,10 @@ class BasicSettingsDialog(QDialog):
         self.max_spread_ticks.setRange(1, 10_000)
         self.max_spread_ticks.setValue(int(settings.get("max_spread_ticks", 3)))
 
-        self.cooldown = QSpinBox()
-        self.cooldown.setRange(0, 10_000)
-        self.cooldown.setValue(int(settings.get("cooldown", 2)))
-
-        self.max_inventory_shift = QDoubleSpinBox()
-        self.max_inventory_shift.setRange(0.0, 1_000_000.0)
-        self.max_inventory_shift.setDecimals(4)
-        self.max_inventory_shift.setValue(float(settings.get("max_inventory_shift", 300.0)))
-
         self.budget_total = QDoubleSpinBox()
         self.budget_total.setRange(0.0, 10_000_000.0)
         self.budget_total.setDecimals(2)
         self.budget_total.setValue(float(settings.get("budget_total", 2000.0)))
-
-        self.budget_passive = QDoubleSpinBox()
-        self.budget_passive.setRange(0.0, 10_000_000.0)
-        self.budget_passive.setDecimals(2)
-        self.budget_passive.setValue(float(settings.get("budget_passive", 800.0)))
-
-        self.budget_traps = QDoubleSpinBox()
-        self.budget_traps.setRange(0.0, 10_000_000.0)
-        self.budget_traps.setDecimals(2)
-        self.budget_traps.setValue(float(settings.get("budget_traps", 700.0)))
-
-        self.budget_anchor = QDoubleSpinBox()
-        self.budget_anchor.setRange(0.0, 10_000_000.0)
-        self.budget_anchor.setDecimals(2)
-        self.budget_anchor.setValue(float(settings.get("budget_anchor", 500.0)))
 
         self.budget_max_one_side = QDoubleSpinBox()
         self.budget_max_one_side.setRange(0.0, 10_000_000.0)
@@ -211,12 +187,21 @@ class BasicSettingsDialog(QDialog):
         self.sizing_random_factor_pct.setRange(0.0, 100.0)
         self.sizing_random_factor_pct.setDecimals(1)
         self.sizing_random_factor_pct.setValue(float(settings.get("sizing_random_factor_pct", 20.0)))
+        self.paper_min_hold_sec = QDoubleSpinBox()
+        self.paper_min_hold_sec.setRange(0.0, 10_000.0)
+        self.paper_min_hold_sec.setValue(float(settings.get("paper_min_hold_sec", 4.0)))
+        self.paper_cycle_cooldown_sec = QDoubleSpinBox()
+        self.paper_cycle_cooldown_sec.setRange(0.0, 10_000.0)
+        self.paper_cycle_cooldown_sec.setValue(float(settings.get("paper_cycle_cooldown_sec", 7.0)))
+        self.paper_max_cycles_per_min = QSpinBox()
+        self.paper_max_cycles_per_min.setRange(1, 10_000)
+        self.paper_max_cycles_per_min.setValue(int(settings.get("paper_max_cycles_per_min", 8)))
 
         sections = [
-            ("Основное", [("Сухой режим", self.dry_run), ("Базовый размер ордера", self.order_size), ("Мин. gap в тиках", self.min_gap_ticks), ("Макс. спред", self.max_spread_ticks)]),
-            ("Бюджет", [("Общий бюджет", self.budget_total), ("Бюджет passive", self.budget_passive), ("Бюджет traps", self.budget_traps), ("Бюджет anchor", self.budget_anchor), ("Максимум в одной стороне", self.budget_max_one_side)]),
+            ("Основное", [("Сухой режим", self.dry_run), ("Размер ордера", self.order_size), ("Мин. gap", self.min_gap_ticks), ("Макс. spread", self.max_spread_ticks)]),
+            ("Бюджет", [("Общий бюджет", self.budget_total), ("Макс. в одной стороне", self.budget_max_one_side)]),
             ("Размер ставки", [("Мин. размер ордера", self.sizing_min_order_size), ("Макс. размер ордера", self.sizing_max_order_size), ("Randomize size", self.sizing_randomize), ("Random factor %", self.sizing_random_factor_pct)]),
-            ("Риск", [("Cooldown сигнала", self.cooldown), ("Макс. inventory skew", self.max_inventory_shift), ("Critical inventory skew", QLabel(str(settings.get("paper_critical_skew_pct", 55.0)))), ("Max open cycles", QLabel(str(settings.get("paper_max_open_cycles", 1)))), ("Max cycles/min", QLabel(str(settings.get("paper_max_cycles_per_min", 8))))]),
+            ("Paper", [("Min hold sec", self.paper_min_hold_sec), ("Cooldown sec", self.paper_cycle_cooldown_sec), ("Max cycles/min", self.paper_max_cycles_per_min)]),
         ]
         for title, rows in sections:
             box = QGroupBox(title)
@@ -240,17 +225,15 @@ class BasicSettingsDialog(QDialog):
             "order_size": self.order_size.value(),
             "min_gap_ticks": self.min_gap_ticks.value(),
             "max_spread_ticks": self.max_spread_ticks.value(),
-            "cooldown": self.cooldown.value(),
-            "max_inventory_shift": self.max_inventory_shift.value(),
             "budget_total": self.budget_total.value(),
-            "budget_passive": self.budget_passive.value(),
-            "budget_traps": self.budget_traps.value(),
-            "budget_anchor": self.budget_anchor.value(),
             "budget_max_one_side": self.budget_max_one_side.value(),
             "sizing_min_order_size": self.sizing_min_order_size.value(),
             "sizing_max_order_size": self.sizing_max_order_size.value(),
             "sizing_randomize": self.sizing_randomize.isChecked(),
             "sizing_random_factor_pct": self.sizing_random_factor_pct.value(),
+            "paper_min_hold_sec": self.paper_min_hold_sec.value(),
+            "paper_cycle_cooldown_sec": self.paper_cycle_cooldown_sec.value(),
+            "paper_max_cycles_per_min": self.paper_max_cycles_per_min.value(),
         }
 
 
@@ -308,7 +291,7 @@ class LUCWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("LUC — EURIUSDT Equilibrium Corridor Harvester")
-        self.resize(1080, 760)
+        self.resize(1280, 840)
 
         self.settings = self.load_settings()
 
@@ -320,9 +303,10 @@ class LUCWindow(QMainWindow):
         self.ws_status = "DISCONNECTED"
         self.http_status = "IDLE"
         self.app_status = "RUNNING"
-        self.mode = "DRY_RUN" if self.settings.get("DRY_RUN", True) else "LIVE_DISABLED"
+        self.mode = "PAPER"
+        self.paper_engine_enabled = True
 
-        self.log_buffer: deque[str] = deque(maxlen=500)
+        self.log_buffer: deque[str] = deque(maxlen=300)
         history_size = int(self.settings.get("history_size", 50))
         self.parent_mid_hist: deque[float] = deque(maxlen=history_size)
         self.child_mid_hist: deque[float] = deque(maxlen=history_size)
@@ -436,75 +420,98 @@ class LUCWindow(QMainWindow):
         layout = QVBoxLayout(root)
 
         top = QHBoxLayout()
+        self.start_btn = QPushButton("START")
+        self.stop_btn = QPushButton("STOP")
+        self.reset_btn = QPushButton("RESET PAPER")
+        self.settings_btn = QPushButton("SETTINGS")
+        self.full_json_btn = QPushButton("FULL JSON")
+        self.start_btn.clicked.connect(self.start_paper_engine)
+        self.stop_btn.clicked.connect(self.stop_paper_engine)
+        self.reset_btn.clicked.connect(self.reset_paper_engine)
+        self.settings_btn.clicked.connect(self.open_basic_settings)
+        self.full_json_btn.clicked.connect(self.open_json_settings)
+        for btn in (self.start_btn, self.stop_btn, self.reset_btn, self.settings_btn, self.full_json_btn):
+            btn.setMinimumHeight(34)
+            top.addWidget(btn)
         self.lbl_app = QLabel()
         self.lbl_ws = QLabel()
         self.lbl_http = QLabel()
         self.lbl_mode = QLabel()
-        self.lbl_symbols = QLabel(f"SYMBOLS: {self.settings['symbols']['parent']} / {self.settings['symbols']['child']}")
+        self.lbl_symbols = QLabel(f"PAIR: {self.settings['symbols']['parent']} → {self.settings['symbols']['child']}")
         for w in (self.lbl_app, self.lbl_ws, self.lbl_http, self.lbl_mode, self.lbl_symbols):
             top.addWidget(w)
         top.addStretch(1)
-        basic_btn = QPushButton("Basic Settings")
-        json_btn = QPushButton("Full JSON Settings")
-        basic_btn.clicked.connect(self.open_basic_settings)
-        json_btn.clicked.connect(self.open_json_settings)
-        top.addWidget(basic_btn)
-        top.addWidget(json_btn)
         layout.addLayout(top)
 
         grid = QGridLayout()
         grid.setHorizontalSpacing(10)
         grid.setVerticalSpacing(8)
-        self.market_labels = self.make_panel(grid, 0, 0, "Market", [
-            "EUR bid", "EUR ask", "EUR mid", "EURI bid", "EURI ask", "EURI mid", "EURI spread",
-            "spread ticks", "EUR dir", "EURI dir", "parent vol ticks", "child stale sec",
+        self.market_labels = self.make_panel(grid, 0, 0, "MARKET", [
+            "EUR bid", "EUR ask", "EUR mid", "EURI bid", "EURI ask", "EURI mid", "EURI spread", "fair gap ticks", "child stale sec",
         ])
-        self.fair_labels = self.make_panel(grid, 0, 1, "Fair Value", [
-            "EUR fair-value", "EURI mid", "fair gap", "fair gap ticks",
-            "corridor age", "corridor stability", "refill/churn",
+        self.signal_labels = self.make_panel(grid, 1, 0, "SIGNAL", [
+            "current state", "regime", "confidence", "market class", "trap readiness",
         ])
-        self.inventory_labels = self.make_panel(grid, 1, 0, "Virtual Inventory", [
-            "EURI balance", "USDT balance", "total value", "inventory skew", "trapped inventory",
-            "realized pnl", "unrealized pnl", "open lots", "avg recycle pnl", "avg trap pnl", "active trapped qty",
+        self.inventory_labels = self.make_panel(grid, 2, 0, "INVENTORY / PNL", [
+            "EURI", "USDT", "total value", "realized pnl", "unrealized pnl", "skew", "open lots",
         ])
-        self.session_labels = self.make_panel(grid, 1, 1, "Paper Engine", [
-            "paper state", "active cycle", "cycles", "wins", "losses", "realized pnl", "unrealized pnl",
-            "avg recycle ticks", "avg hold time", "trap success", "cycle lifecycle", "active lot age", "max adverse excursion", "partial recycle",
-            "fill quality", "entry snapshot age", "cooldown remaining", "min hold remaining", "snapshots in cycle",
-            "cycles/min", "last entry snapshot", "last exit snapshot",
+        self.engine_labels = self.make_panel(grid, 0, 1, "PAPER ENGINE", [
+            "engine status", "paper state", "active cycle", "lifecycle", "fill quality", "cooldown", "min hold", "cycles/min",
         ])
-        self.state_labels = self.make_panel(grid, 2, 0, "Market State", [
-            "current state", "corridor state", "trap readiness", "parent state", "stale state",
+        self.session_labels = self.make_panel(grid, 1, 1, "SESSION", [
+            "cycles", "wins", "losses", "winrate", "avg pnl", "avg ticks", "avg hold",
         ])
-        self.micro_labels = self.make_panel(grid, 2, 1, "Microstructure", [
-            "equilibrium score", "passive viability", "trap survivability", "refill strength",
-            "spread state", "churn quality", "center stability", "mean reversion quality", "market class",
+        self.sizing_labels = self.make_panel(grid, 2, 1, "SIZING", [
+            "passive size", "trap size", "anchor layer 1", "anchor layer 2", "anchor layer 3",
+            "budget used %", "random factor",
         ])
-        self.regime_labels = self.make_panel(grid, 3, 0, "Regime Panel", [
-            "current regime", "regime confidence", "regime duration", "last transition", "transition cooldown", "regime stability",
+        self.ledger_labels = self.make_panel(grid, 3, 1, "LEDGER LAST EVENTS", [
+            "event 1", "event 2", "event 3", "event 4", "event 5",
         ])
         layout.addLayout(grid)
-
         self.log_box = QPlainTextEdit()
         self.log_box.setReadOnly(True)
-        self.log_box.setMaximumBlockCount(600)
+        self.log_box.setMaximumBlockCount(300)
+        self.log_box.setMinimumHeight(170)
         layout.addWidget(self.log_box, 1)
-
-        self.sizing_labels = self.make_panel(grid, 4, 0, "Sizing / Budget", [
-            "recommended passive size", "recommended trap size", "recommended anchor layer 1", "recommended anchor layer 2", "recommended anchor layer 3",
-            "budget used %", "inventory factor", "random factor", "active sizing mode",
-        ])
-
-        self.ledger_labels = self.make_panel(grid, 3, 1, "Ledger Last Events", [
-            "event 1", "event 2", "event 3", "event 4", "event 5", "event 6", "event 7", "event 8",
-        ])
         grid.setColumnStretch(0, 1)
         grid.setColumnStretch(1, 1)
         grid.setRowStretch(0, 2)
         grid.setRowStretch(1, 3)
         grid.setRowStretch(2, 2)
         grid.setRowStretch(3, 2)
-        grid.setRowStretch(4, 2)
+        grid.setRowStretch(4, 0)
+
+    def start_paper_engine(self) -> None:
+        self.paper_engine_enabled = True
+        self.mode = "PAPER"
+        self.log("[CONTROL] paper engine START")
+
+    def stop_paper_engine(self) -> None:
+        self.paper_engine_enabled = False
+        self.mode = "STOPPED"
+        self.log("[CONTROL] paper engine STOP (no new entries)")
+
+    def reset_paper_engine(self) -> None:
+        self.paper_state = PaperPositionState.FLAT
+        self.paper_euri = float(self.settings.get("paper_start_euri", 1000.0))
+        self.paper_usdt = float(self.settings.get("paper_start_usdt", 1000.0))
+        self.paper_realized_pnl = 0.0
+        self.paper_cycles = 0
+        self.paper_wins = 0
+        self.paper_losses = 0
+        self.paper_total_ticks = 0.0
+        self.paper_total_hold_sec = 0.0
+        self.paper_last_cycle = "-"
+        self.paper_lots.clear()
+        self.paper_ledger.clear()
+        self.paper_cycle_state = CycleState.CLOSED
+        self.paper_cycle_side = "NONE"
+        self.paper_cycle_source = "NONE"
+        self.paper_trapped_euri = 0.0
+        self.paper_entry_ts = 0.0
+        self.paper_cycle_timestamps.clear()
+        self.log("[CONTROL] paper engine RESET")
 
     def make_panel(self, grid: QGridLayout, row: int, col: int, title: str, fields: list[str]) -> dict[str, QLabel]:
         box = QGroupBox(title)
@@ -645,7 +652,7 @@ class LUCWindow(QMainWindow):
         return "#b7bdc8"
 
     def _set_state_label(self, name: str, state: MarketState) -> None:
-        label = self.state_labels[name]
+        label = self.signal_labels[name]
         label.setText(state.value)
         label.setStyleSheet(f"color: {self._state_color(state)}; font-weight: bold;")
 
@@ -676,7 +683,7 @@ class LUCWindow(QMainWindow):
         return "#FF6E6E"
 
     def _set_regime_label(self, name: str, value: str, regime: Regime | None = None) -> None:
-        label = self.regime_labels[name]
+        label = self.signal_labels[name]
         color = self._regime_color(regime) if regime else "#b7bdc8"
         label.setText(value)
         label.setStyleSheet(f"color: {color}; font-weight: bold;")
@@ -728,7 +735,7 @@ class LUCWindow(QMainWindow):
             self.log(f"[REGIME] {'stable' if stability >= 70 else 'violent'} transition")
 
     def _set_micro_label(self, name: str, value: str, level: str) -> None:
-        label = self.micro_labels[name]
+        label = self.signal_labels[name]
         label.setText(value)
         label.setStyleSheet(f"color: {self._micro_color(level)}; font-weight: bold;")
 
@@ -1014,6 +1021,8 @@ class LUCWindow(QMainWindow):
                 self.paper_cycle_source = "NONE"
                 self.paper_trapped_euri = 0.0
             return
+        if not self.paper_engine_enabled:
+            return
         if len(self.paper_lots) >= self.paper_max_open_cycles:
             self._warn_once("max_cycles", "[WARN] max_open_cycles reached")
             return
@@ -1244,9 +1253,9 @@ class LUCWindow(QMainWindow):
 
         self._log_state_change(state)
 
-        self.lbl_app.setText(f"APP STATUS: {self.app_status}")
-        self.lbl_ws.setText(f"WS STATUS: {self.ws_status}")
-        self.lbl_http.setText(f"HTTP STATUS: {self.http_status}")
+        self.lbl_app.setText(f"APP: {self.app_status}")
+        self.lbl_ws.setText(f"WS: {'OK' if self.ws_status == 'CONNECTED' else self.ws_status}")
+        self.lbl_http.setText(f"HTTP: {self.http_status}")
         self.lbl_mode.setText(f"MODE: {self.mode}")
 
         self.market_labels["EUR bid"].setText(f"{self.parent_bid:.6f}")
@@ -1256,34 +1265,13 @@ class LUCWindow(QMainWindow):
         self.market_labels["EURI ask"].setText(f"{self.child_ask:.6f}")
         self.market_labels["EURI mid"].setText(f"{child_mid:.6f}")
         self.market_labels["EURI spread"].setText(f"{spread:.6f}")
-        self.market_labels["spread ticks"].setText(f"{spread_ticks:.2f}")
-        self.market_labels["EUR dir"].setText(parent_dir)
-        self.market_labels["EURI dir"].setText(child_dir)
-        self.market_labels["parent vol ticks"].setText(f"{parent_vol_ticks:.2f}")
+        self.market_labels["fair gap ticks"].setText(f"{gap_ticks:.2f}")
         self.market_labels["child stale sec"].setText(f"{child_stale_sec:.1f}")
 
-        self.fair_labels["EUR fair-value"].setText(f"{parent_mid:.6f}")
-        self.fair_labels["EURI mid"].setText(f"{child_mid:.6f}")
-        self.fair_labels["fair gap"].setText(f"{gap:.6f}")
-        self.fair_labels["fair gap ticks"].setText(f"{gap_ticks:.2f}")
-        self.fair_labels["corridor age"].setText(str(corridor_age))
-        self.fair_labels["corridor stability"].setText("stable" if corridor_stable else "unstable")
-        self.fair_labels["refill/churn"].setText(f"{churn:.2f}")
-
         self._set_state_label("current state", state)
-        self._set_state_label("corridor state", self.corridor_state)
         self._set_state_label("trap readiness", self.trap_readiness)
-        self._set_state_label("parent state", self.parent_state)
-        self._set_state_label("stale state", self.stale_state)
-
-        self._set_micro_label("equilibrium score", f"{equilibrium_score}", "HIGH" if equilibrium_score >= 70 else "MEDIUM" if equilibrium_score >= 45 else "LOW")
-        self._set_micro_label("passive viability", f"{passive_viability}", "HIGH" if passive_viability >= 70 else "MEDIUM" if passive_viability >= 45 else "LOW")
-        self._set_micro_label("trap survivability", f"{trap_survivability}", "SURVIVABLE" if trap_survivability >= 65 else "CAUTION" if trap_survivability >= 45 else "DANGEROUS")
-        self._set_micro_label("refill strength", refill_strength, "RED" if refill_strength == "AGGRESSIVE_REFILL" else "NORMAL" if refill_strength == "NORMAL_REFILL" else "GREEN")
-        self._set_micro_label("spread state", spread_state, spread_state)
-        self._set_micro_label("churn quality", churn_quality, "CALM" if churn_quality == "CALM" else "RECYCLING" if churn_quality == "RECYCLING" else "DANGEROUS")
-        self._set_micro_label("center stability", f"{center_stability}", "HIGH" if center_stability >= 70 else "MEDIUM" if center_stability >= 45 else "LOW")
-        self._set_micro_label("mean reversion quality", f"{mean_reversion_quality}", "HIGH" if mean_reversion_quality >= 70 else "MEDIUM" if mean_reversion_quality >= 45 else "BROKEN")
+        self._set_regime_label("regime", self.current_regime.value, self.current_regime)
+        self._set_regime_label("confidence", f"{self._regime_confidence}", self.current_regime)
         self._set_micro_label("market class", market_class, "GREEN" if market_class == "IDEAL_MARKET" else "RED" if market_class == "DANGEROUS_MARKET" else "ORANGE")
 
         self._log_micro_change("eq", f"equilibrium={equilibrium_score} passive={passive_viability} class={market_class}")
@@ -1298,56 +1286,39 @@ class LUCWindow(QMainWindow):
             self.log(f"[REGIME] {self.current_regime.value} confidence={self._regime_confidence}")
         cooldown_left = max(0.0, self._regime_cooldown_until - now_ts)
         transition_quality = "stable transition" if regime_stability >= 70 else "violent transition" if regime_stability <= 40 else "mixed transition"
-        self._set_regime_label("current regime", self.current_regime.value, self.current_regime)
-        self._set_regime_label("regime confidence", f"{self._regime_confidence}", self.current_regime)
-        self._set_regime_label("regime duration", f"{regime_duration:.1f}s", self.current_regime)
-        self._set_regime_label("last transition", self._regime_last_transition, self.current_regime)
-        self._set_regime_label("transition cooldown", f"{cooldown_left:.1f}s", self.current_regime)
-        self._set_regime_label("regime stability", f"{regime_stability} ({transition_quality})", self.current_regime)
 
         total_value, skew, _, unrealized = self._inventory_metrics(child_mid)
         avg_ticks = self.paper_total_ticks / self.paper_cycles if self.paper_cycles else 0.0
         avg_hold = self.paper_total_hold_sec / self.paper_cycles if self.paper_cycles else 0.0
         trap_success = (self.paper_trap_success / self.paper_trap_attempts * 100.0) if self.paper_trap_attempts else 0.0
 
-        self.inventory_labels["EURI balance"].setText(f"{self.paper_euri:.2f}")
-        self.inventory_labels["USDT balance"].setText(f"{self.paper_usdt:.2f}")
+        self.inventory_labels["EURI"].setText(f"{self.paper_euri:.2f}")
+        self.inventory_labels["USDT"].setText(f"{self.paper_usdt:.2f}")
         self.inventory_labels["total value"].setText(f"{total_value:.2f}")
-        self.inventory_labels["inventory skew"].setText(f"{skew:+.2f}%")
-        self.inventory_labels["trapped inventory"].setText(f"{self.paper_trapped_euri:.2f}")
+        self.inventory_labels["skew"].setText(f"{skew:+.2f}%")
         self.inventory_labels["realized pnl"].setText(f"{self.paper_realized_pnl:+.4f}")
         self.inventory_labels["unrealized pnl"].setText(f"{unrealized:+.4f}")
         self.inventory_labels["open lots"].setText(str(len(self.paper_lots)))
-        self.inventory_labels["avg recycle pnl"].setText(f"{self.paper_avg_recycle_pnl:+.4f}")
-        self.inventory_labels["avg trap pnl"].setText(f"{self.paper_avg_trap_pnl:+.4f}")
-        self.inventory_labels["active trapped qty"].setText(f"{self.paper_trapped_euri:.2f}")
 
-        self.session_labels["paper state"].setText(self.paper_state.value)
-        self.session_labels["active cycle"].setText(f"{self.paper_last_cycle} [{self.paper_cycle_source}/{self.paper_cycle_state.value}]")
+        self.engine_labels["engine status"].setText("STARTED" if self.paper_engine_enabled else "STOPPED")
+        self.engine_labels["paper state"].setText(self.paper_state.value)
+        self.engine_labels["active cycle"].setText(f"{self.paper_last_cycle} [{self.paper_cycle_source}]")
         self.session_labels["cycles"].setText(str(self.paper_cycles))
         self.session_labels["wins"].setText(str(self.paper_wins))
         self.session_labels["losses"].setText(str(self.paper_losses))
-        self.session_labels["realized pnl"].setText(f"{self.paper_realized_pnl:+.4f}")
-        self.session_labels["unrealized pnl"].setText(f"{unrealized:+.4f}")
-        self.session_labels["avg recycle ticks"].setText(f"{avg_ticks:+.2f}")
-        self.session_labels["avg hold time"].setText(f"{avg_hold:.1f}s")
-        self.session_labels["trap success"].setText(f"{trap_success:.1f}%")
-        self.session_labels["cycle lifecycle"].setText(self.paper_cycle_state.value)
-        self.session_labels["active lot age"].setText(f"{max(0.0, time.time() - self.paper_entry_ts):.1f}s" if self.paper_entry_ts else "0.0s")
-        self.session_labels["max adverse excursion"].setText(f"{self.paper_cycle_mae:+.4f}")
-        self.session_labels["partial recycle"].setText(self.paper_cycle_partial)
+        self.session_labels["winrate"].setText(f"{(self.paper_wins / self.paper_cycles * 100.0) if self.paper_cycles else 0.0:.1f}%")
+        self.session_labels["avg pnl"].setText(f"{(self.paper_realized_pnl / self.paper_cycles) if self.paper_cycles else 0.0:+.4f}")
+        self.session_labels["avg ticks"].setText(f"{avg_ticks:+.2f}")
+        self.session_labels["avg hold"].setText(f"{avg_hold:.1f}s")
         entry_age = max(0, self.euri_snapshot_id - self.last_entry_snapshot_id) if self.last_entry_snapshot_id >= 0 else 0
         cool_left = max(0.0, (self.paper_last_close_ts + float(self.settings.get("paper_cycle_cooldown_sec", 7.0))) - now_ts)
         hold_left = max(0.0, (self.paper_entry_ts + float(self.settings.get("paper_min_hold_sec", 4.0))) - now_ts) if self.paper_entry_ts else 0.0
         cycles_min = len(self.paper_cycle_timestamps)
-        self.session_labels["fill quality"].setText(f"{self.paper_fill_quality}")
-        self.session_labels["entry snapshot age"].setText(str(entry_age))
-        self.session_labels["cooldown remaining"].setText(f"{cool_left:.1f}s")
-        self.session_labels["min hold remaining"].setText(f"{hold_left:.1f}s")
-        self.session_labels["snapshots in cycle"].setText(str(self.paper_cycle_snapshots))
-        self.session_labels["cycles/min"].setText(str(cycles_min))
-        self.session_labels["last entry snapshot"].setText(str(self.last_entry_snapshot_id))
-        self.session_labels["last exit snapshot"].setText(str(self.last_exit_snapshot_id))
+        self.engine_labels["lifecycle"].setText(self.paper_cycle_state.value)
+        self.engine_labels["fill quality"].setText(f"{self.paper_fill_quality}")
+        self.engine_labels["cooldown"].setText(f"{cool_left:.1f}s")
+        self.engine_labels["min hold"].setText(f"{hold_left:.1f}s")
+        self.engine_labels["cycles/min"].setText(str(cycles_min))
         cp = getattr(self, "current_sizing", {})
         passive_rec = cp.get("passive", {}).get("size", 0.0)
         trap_rec = max(cp.get("trap_buy", {}).get("size", 0.0), cp.get("trap_sell", {}).get("size", 0.0))
@@ -1358,16 +1329,14 @@ class LUCWindow(QMainWindow):
         inv_factor = cp.get("passive", {}).get("inventory_factor", 1.0)
         rnd_factor = cp.get("passive", {}).get("random_factor", 1.0)
         active_mode = self.paper_cycle_source if self.paper_cycle_source != "NONE" else "IDLE"
-        self.sizing_labels["recommended passive size"].setText(f"{passive_rec:.2f}")
-        self.sizing_labels["recommended trap size"].setText(f"{trap_rec:.2f}")
-        self.sizing_labels["recommended anchor layer 1"].setText(f"{anchor1:.2f}")
-        self.sizing_labels["recommended anchor layer 2"].setText(f"{anchor2:.2f}")
-        self.sizing_labels["recommended anchor layer 3"].setText(f"{anchor3:.2f}")
+        self.sizing_labels["passive size"].setText(f"{passive_rec:.2f}")
+        self.sizing_labels["trap size"].setText(f"{trap_rec:.2f}")
+        self.sizing_labels["anchor layer 1"].setText(f"{anchor1:.2f}")
+        self.sizing_labels["anchor layer 2"].setText(f"{anchor2:.2f}")
+        self.sizing_labels["anchor layer 3"].setText(f"{anchor3:.2f}")
         self.sizing_labels["budget used %"].setText(f"{used_budget:.1f}%")
-        self.sizing_labels["inventory factor"].setText(f"{inv_factor:.2f}")
         self.sizing_labels["random factor"].setText(f"{rnd_factor:.2f}")
-        self.sizing_labels["active sizing mode"].setText(active_mode)
-        for idx, key in enumerate(["event 1", "event 2", "event 3", "event 4", "event 5", "event 6", "event 7", "event 8"]):
+        for idx, key in enumerate(["event 1", "event 2", "event 3", "event 4", "event 5"]):
             if idx < len(self.paper_ledger):
                 evt = self.paper_ledger[idx]
                 self.ledger_labels[key].setText(f"{evt['timestamp']} {evt['type']} {evt['side']} {evt['qty']:.2f} pnl={evt['realized_pnl']:+.4f}")
