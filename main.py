@@ -200,8 +200,8 @@ class BasicSettingsDialog(QDialog):
         sections = [
             ("Основное", [("Сухой режим", self.dry_run), ("Размер ордера", self.order_size), ("Мин. gap", self.min_gap_ticks), ("Макс. spread", self.max_spread_ticks)]),
             ("Бюджет", [("Общий бюджет", self.budget_total), ("Макс. в одной стороне", self.budget_max_one_side)]),
-            ("Размер ставки", [("Мин. размер ордера", self.sizing_min_order_size), ("Макс. размер ордера", self.sizing_max_order_size), ("Randomize size", self.sizing_randomize), ("Random factor %", self.sizing_random_factor_pct)]),
-            ("Paper", [("Min hold sec", self.paper_min_hold_sec), ("Cooldown sec", self.paper_cycle_cooldown_sec), ("Max cycles/min", self.paper_max_cycles_per_min)]),
+            ("Размер ставки", [("Мин. ордер", self.sizing_min_order_size), ("Макс. ордер", self.sizing_max_order_size), ("Random size", self.sizing_randomize), ("Random %", self.sizing_random_factor_pct)]),
+            ("Paper", [("Min hold", self.paper_min_hold_sec), ("Cooldown", self.paper_cycle_cooldown_sec), ("Max cycles/min", self.paper_max_cycles_per_min)]),
         ]
         for title, rows in sections:
             box = QGroupBox(title)
@@ -303,8 +303,9 @@ class LUCWindow(QMainWindow):
         self.ws_status = "DISCONNECTED"
         self.http_status = "IDLE"
         self.app_status = "RUNNING"
-        self.mode = "PAPER"
-        self.paper_engine_enabled = True
+        self.mode = "STOPPED"
+        self.paper_engine_enabled = False
+        self.paper_entry_block_reason = "STOPPED"
 
         self.log_buffer: deque[str] = deque(maxlen=300)
         history_size = int(self.settings.get("history_size", 50))
@@ -449,14 +450,12 @@ class LUCWindow(QMainWindow):
         self.market_labels = self.make_panel(grid, 0, 0, "MARKET", [
             "EUR bid", "EUR ask", "EUR mid", "EURI bid", "EURI ask", "EURI mid", "EURI spread", "fair gap ticks", "child stale sec",
         ])
-        self.signal_labels = self.make_panel(grid, 1, 0, "SIGNAL", [
-            "current state", "regime", "confidence", "market class", "trap readiness",
-        ])
+        self.signal_labels = self.make_panel(grid, 1, 0, "SIGNAL", ["current state", "regime", "trap readiness"])
         self.inventory_labels = self.make_panel(grid, 2, 0, "INVENTORY / PNL", [
             "EURI", "USDT", "total value", "realized pnl", "unrealized pnl", "skew", "open lots",
         ])
         self.engine_labels = self.make_panel(grid, 0, 1, "PAPER ENGINE", [
-            "engine status", "paper state", "active cycle", "lifecycle", "fill quality", "cooldown", "min hold", "cycles/min",
+            "engine status", "paper state", "active cycle", "entry block reason", "fill quality", "cooldown", "min hold", "cycles/min",
         ])
         self.session_labels = self.make_panel(grid, 1, 1, "SESSION", [
             "cycles", "wins", "losses", "winrate", "avg pnl", "avg ticks", "avg hold",
@@ -485,11 +484,13 @@ class LUCWindow(QMainWindow):
     def start_paper_engine(self) -> None:
         self.paper_engine_enabled = True
         self.mode = "PAPER"
+        self.paper_entry_block_reason = "waiting_new_snapshot"
         self.log("[CONTROL] paper engine START")
 
     def stop_paper_engine(self) -> None:
         self.paper_engine_enabled = False
         self.mode = "STOPPED"
+        self.paper_entry_block_reason = "STOPPED"
         self.log("[CONTROL] paper engine STOP (no new entries)")
 
     def reset_paper_engine(self) -> None:
@@ -916,6 +917,7 @@ class LUCWindow(QMainWindow):
         return {"size": size, "inventory_factor": inventory_factor, "random_factor": random_factor, "mode": mode}
 
     def _paper_step(self, *, now_ts: float, child_mid: float, gap_ticks: float, spread_ticks: float, parent_dir: str, regime: Regime, passive_viability: int, trap_survivability: int, refill_strength: str, churn_quality: str, child_stale_sec: float) -> None:
+        self.paper_entry_block_reason = "-"
         if child_mid <= 0:
             return
         qty = float(self.settings.get("paper_order_size_euri", self.settings.get("order_size", 50.0)))
@@ -1022,13 +1024,17 @@ class LUCWindow(QMainWindow):
                 self.paper_trapped_euri = 0.0
             return
         if not self.paper_engine_enabled:
+            self.paper_entry_block_reason = "STOPPED"
             return
         if len(self.paper_lots) >= self.paper_max_open_cycles:
+            self.paper_entry_block_reason = "max_cycles"
             self._warn_once("max_cycles", "[WARN] max_open_cycles reached")
             return
         if regime in {Regime.DANGEROUS, Regime.ESCAPE, Regime.CAUTION} or abs(skew) >= critical_skew:
+            self.paper_entry_block_reason = "regime_not_allowed"
             return
         if spread_ticks > max_spread_ticks:
+            self.paper_entry_block_reason = "spread_too_wide"
             return
 
         tick = float(self.settings.get("tick_size", 0.0001))
@@ -1039,13 +1045,14 @@ class LUCWindow(QMainWindow):
             if self.paper_usdt >= qty * self.child_bid and self._can_open_new_cycle():
                 fill_delay = self._paper_fill_delay_snapshots(spread_ticks, passive_viability, refill_strength, churn_quality, child_stale_sec <= 2.5)
                 if fill_delay < 0:
+                    self.paper_entry_block_reason = "no_price_touch"
                     return
                 self.paper_fill_delay_left = fill_delay
                 if self.paper_fill_delay_left > 1:
                     self.paper_fill_delay_left -= 1
+                    self.paper_entry_block_reason = "fill_delay"
                     return
                 qty = sizing_passive["size"]
-                qty = sizing_trap_sell["size"]
                 self.paper_entry_price = self.child_bid
                 self.paper_usdt -= qty * self.paper_entry_price
                 self.paper_euri += qty
@@ -1060,6 +1067,7 @@ class LUCWindow(QMainWindow):
                 self.paper_cycle_entry_snapshot_id = self.euri_snapshot_id
                 self.paper_cycle_snapshots = 1
                 if self._open_lot(side="BUY", qty=qty, price=self.paper_entry_price, now_ts=now_ts, source="PASSIVE"):
+                    self.paper_entry_block_reason = "-"
                     self.log(f"[PAPER] open PASSIVE BUY qty={qty:.2f} price={self.paper_entry_price:.4f}")
         elif regime == Regime.IDEAL_TRAP and trap_survivability >= min_trap and gap_ticks >= min_gap_ticks and parent_dir == "UP":
             if self.paper_usdt >= qty * self.child_ask and self._can_open_new_cycle():
@@ -1079,6 +1087,7 @@ class LUCWindow(QMainWindow):
                 self.paper_cycle_entry_snapshot_id = self.euri_snapshot_id
                 self.paper_cycle_snapshots = 1
                 self._open_lot(side="BUY", qty=qty, price=self.paper_entry_price, now_ts=now_ts, source="BUY_TRAP")
+                self.paper_entry_block_reason = "-"
                 self._paper_log("open_buy", "[PAPER] BUY_TRAP opened")
         elif regime == Regime.IDEAL_TRAP and trap_survivability >= min_trap and gap_ticks <= -min_gap_ticks and parent_dir == "DOWN":
             if self.paper_euri >= qty and self._can_open_new_cycle():
@@ -1097,7 +1106,18 @@ class LUCWindow(QMainWindow):
                 self.paper_cycle_entry_snapshot_id = self.euri_snapshot_id
                 self.paper_cycle_snapshots = 1
                 self._open_lot(side="SELL", qty=qty, price=self.paper_entry_price, now_ts=now_ts, source="SELL_TRAP")
+                self.paper_entry_block_reason = "-"
                 self._paper_log("open_sell", "[PAPER] SELL_TRAP opened")
+        elif self.euri_snapshot_id <= self.last_entry_snapshot_id:
+            self.paper_entry_block_reason = "same_snapshot"
+        elif not self._can_open_new_cycle():
+            self.paper_entry_block_reason = "cooldown"
+        elif abs(skew) >= danger_skew:
+            self.paper_entry_block_reason = "skew_limit"
+        elif regime not in {Regime.IDEAL_PASSIVE, Regime.IDEAL_TRAP}:
+            self.paper_entry_block_reason = "waiting_new_snapshot"
+        else:
+            self.paper_entry_block_reason = "no_price_touch"
         if abs((self.paper_realized_pnl + unrealized) - (total_value - start_value)) > 0.8:
             self._warn_once("accounting_mismatch", "[WARN] accounting mismatch")
 
@@ -1271,8 +1291,6 @@ class LUCWindow(QMainWindow):
         self._set_state_label("current state", state)
         self._set_state_label("trap readiness", self.trap_readiness)
         self._set_regime_label("regime", self.current_regime.value, self.current_regime)
-        self._set_regime_label("confidence", f"{self._regime_confidence}", self.current_regime)
-        self._set_micro_label("market class", market_class, "GREEN" if market_class == "IDEAL_MARKET" else "RED" if market_class == "DANGEROUS_MARKET" else "ORANGE")
 
         self._log_micro_change("eq", f"equilibrium={equilibrium_score} passive={passive_viability} class={market_class}")
         self._log_micro_change("refill", f"refill={refill_strength}")
@@ -1314,7 +1332,7 @@ class LUCWindow(QMainWindow):
         cool_left = max(0.0, (self.paper_last_close_ts + float(self.settings.get("paper_cycle_cooldown_sec", 7.0))) - now_ts)
         hold_left = max(0.0, (self.paper_entry_ts + float(self.settings.get("paper_min_hold_sec", 4.0))) - now_ts) if self.paper_entry_ts else 0.0
         cycles_min = len(self.paper_cycle_timestamps)
-        self.engine_labels["lifecycle"].setText(self.paper_cycle_state.value)
+        self.engine_labels["entry block reason"].setText(self.paper_entry_block_reason)
         self.engine_labels["fill quality"].setText(f"{self.paper_fill_quality}")
         self.engine_labels["cooldown"].setText(f"{cool_left:.1f}s")
         self.engine_labels["min hold"].setText(f"{hold_left:.1f}s")
@@ -1341,7 +1359,12 @@ class LUCWindow(QMainWindow):
                 evt = self.paper_ledger[idx]
                 self.ledger_labels[key].setText(f"{evt['timestamp']} {evt['type']} {evt['side']} {evt['qty']:.2f} pnl={evt['realized_pnl']:+.4f}")
             else:
-                self.ledger_labels[key].setText("-")
+                if idx == 0 and not self.paper_engine_enabled:
+                    self.ledger_labels[key].setText("Paper stopped")
+                elif idx == 0:
+                    self.ledger_labels[key].setText("Нет событий — нажмите START или ждём условия входа")
+                else:
+                    self.ledger_labels[key].setText("-")
 
     def log(self, message: str) -> None:
         ts = datetime.now().strftime("%H:%M:%S")
