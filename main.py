@@ -38,7 +38,7 @@ CONFIG_PATH = Path(__file__).resolve().parent / "config" / "settings.json"
 
 def default_settings() -> dict:
         return {
-            "version": "0.2.2",
+            "version": "0.2.3",
         "binance_api_key": "",
         "binance_api_secret": "",
         "use_testnet": False,
@@ -572,7 +572,7 @@ class LUCTerminal(QMainWindow):
         self.setCentralWidget(central)
 
         top = QHBoxLayout()
-        self.version_label = self._status_label("LUC VERSION: 0.2.1")
+        self.version_label = self._status_label("LUC VERSION: 0.2.3")
         self.api_status_label = self._status_label("API STATUS: DISCONNECTED")
         self.eur_status = self._status_label("EURUSDT STATUS: IDLE")
         self.euri_status = self._status_label("EURIUSDT STATUS: IDLE")
@@ -1368,6 +1368,35 @@ class LUCTerminal(QMainWindow):
         cycles_map = self.runtime.get("cycles_map", {})
         if not isinstance(cycles_map, dict):
             return
+        trap_cfg = self.settings.get("trap", {})
+        general_cfg = self.settings.get("general", {})
+        tick_size = float(self.runtime.get("filters", {}).get("tickSize", 0.0001) or 0.0001)
+        max_lifetime = float(general_cfg.get("max_order_lifetime_sec", 60))
+        trap_cooldown_sec = float(trap_cfg.get("trap_cooldown_sec", 3))
+        trap_min_gap_ticks = int(trap_cfg.get("trap_min_gap_ticks", 2))
+        def _promote_partial_to_exit(cycle_id: str, cycle: dict, entry: dict, qty_value: float) -> None:
+            entry_price_local = float(entry.get("price") or cycle.get("entry_price", 0.0) or 0.0)
+            cycle["qty"] = qty_value
+            cycle["entry_price"] = entry_price_local
+            cycle["state"] = "ENTRY_FILLED"
+            cycle["updated_ts"] = time.time()
+            self._append_log(f"[CYCLE] partial entry handled qty={qty_value:.8f}")
+            target_ticks_local = int(cycle.get("target_ticks", 1) or 1)
+            delta_local = tick_size * max(1, target_ticks_local)
+            exit_side_local = cycle.get("exit_side", "SELL" if cycle.get("entry_side") == "BUY" else "BUY")
+            if cycle.get("entry_side") == "BUY":
+                exit_price_local = self._round_down(entry_price_local + delta_local, tick_size)
+                exit_resp_local = self.client.place_limit_sell("EURIUSDT", qty_value, exit_price_local)
+            else:
+                exit_price_local = max(tick_size, self._round_down(entry_price_local - delta_local, tick_size))
+                exit_resp_local = self.client.place_limit_buy("EURIUSDT", qty_value, exit_price_local)
+            exit_order_id_local = exit_resp_local.get("orderId")
+            cycle["exit_order_id"] = exit_order_id_local
+            cycle["exit_side"] = exit_side_local
+            cycle["exit_price"] = exit_price_local
+            cycle["state"] = "EXIT_PENDING"
+            cycle["updated_ts"] = time.time()
+            self.runtime.setdefault("order_to_cycle", {})[str(exit_order_id_local)] = cycle_id
         for cycle_id, cycle in list(cycles_map.items()):
             state = cycle.get("state")
             try:
@@ -1376,7 +1405,12 @@ class LUCTerminal(QMainWindow):
                     if not entry_order_id:
                         continue
                     entry = self.client.get_order("EURIUSDT", int(entry_order_id))
-                    if entry.get("status") == "FILLED":
+                    entry_status = str(entry.get("status", ""))
+                    entry_created = float(cycle.get("created_ts", time.time()))
+                    age_sec = max(0.0, time.time() - entry_created)
+                    executed_qty = float(entry.get("executedQty", 0.0) or 0.0)
+                    orig_qty = float(cycle.get("qty", 0.0) or 0.0)
+                    if entry_status == "FILLED":
                         executed_qty = float(entry.get("executedQty", cycle.get("qty", 0.0)) or 0.0)
                         if executed_qty <= 0:
                             continue
@@ -1409,6 +1443,69 @@ class LUCTerminal(QMainWindow):
                         self.runtime.setdefault("order_to_cycle", {})[str(exit_order_id)] = cycle_id
                         self._append_log(f"[CYCLE] exit limit placed #{cycle_id} order={exit_order_id} side={exit_side} price={exit_price:.8f} qty={executed_qty:.8f}")
                         self._refresh_balances_only()
+                    elif entry_status in {"NEW", "PARTIALLY_FILLED"}:
+                        fair_gap_ticks = self.runtime.get("fair_gap_ticks")
+                        gap_gone = False
+                        if cycle.get("mode") == "BUY_TRAP" and fair_gap_ticks is not None and fair_gap_ticks < trap_min_gap_ticks:
+                            gap_gone = True
+                        if cycle.get("mode") == "SELL_TRAP" and fair_gap_ticks is not None and fair_gap_ticks > -trap_min_gap_ticks:
+                            gap_gone = True
+                        if gap_gone and bool(trap_cfg.get("cancel_if_gap_gone", True)):
+                            self.client.cancel_order("EURIUSDT", int(entry_order_id))
+                            if executed_qty > 0:
+                                _promote_partial_to_exit(cycle_id, cycle, entry, min(orig_qty, executed_qty))
+                            else:
+                                cycle["state"] = "CANCELED"
+                            cycle["updated_ts"] = time.time()
+                            self._append_log("[CYCLE] entry cancel gap_gone")
+                            self._refresh_open_orders()
+                            self._refresh_balances_only()
+                            continue
+                        if age_sec > max_lifetime:
+                            self._append_log(f"[CYCLE] entry stale age={age_sec:.1f}s")
+                            if executed_qty > 0:
+                                try:
+                                    self.client.cancel_order("EURIUSDT", int(entry_order_id))
+                                except Exception:
+                                    pass
+                                _promote_partial_to_exit(cycle_id, cycle, entry, min(orig_qty, executed_qty))
+                            else:
+                                self.client.cancel_order("EURIUSDT", int(entry_order_id))
+                                cycle["state"] = "CANCELED"
+                                cycle["updated_ts"] = time.time()
+                                self._append_log("[CYCLE] entry canceled stale")
+                            self._refresh_open_orders()
+                            self._refresh_balances_only()
+                            continue
+                        if cycle.get("mode") in {"BUY_TRAP", "SELL_TRAP"}:
+                            last_reprice = float(cycle.get("last_reprice_ts", 0.0))
+                            if time.time() - last_reprice >= trap_cooldown_sec:
+                                euri = self.runtime.get("euri", {})
+                                if cycle.get("mode") == "BUY_TRAP":
+                                    new_price = float(euri.get("ask", 0.0) or 0.0)
+                                else:
+                                    new_price = float(euri.get("bid", 0.0) or 0.0)
+                                old_price = float(cycle.get("entry_price", 0.0) or 0.0)
+                                if new_price > 0 and old_price > 0 and abs(new_price - old_price) >= tick_size:
+                                    self.client.cancel_order("EURIUSDT", int(entry_order_id))
+                                    if executed_qty > 0:
+                                        _promote_partial_to_exit(cycle_id, cycle, entry, min(orig_qty, executed_qty))
+                                        self._refresh_open_orders()
+                                        self._refresh_balances_only()
+                                        continue
+                                    if cycle.get("mode") == "BUY_TRAP":
+                                        resp = self.client.place_limit_buy("EURIUSDT", orig_qty, new_price)
+                                    else:
+                                        resp = self.client.place_limit_sell("EURIUSDT", orig_qty, new_price)
+                                    new_order_id = resp.get("orderId")
+                                    cycle["entry_order_id"] = new_order_id
+                                    cycle["entry_price"] = new_price
+                                    cycle["last_reprice_ts"] = time.time()
+                                    cycle["updated_ts"] = time.time()
+                                    self.runtime.setdefault("order_to_cycle", {})[str(new_order_id)] = cycle_id
+                                    self._append_log(f"[CYCLE] entry reprice old={old_price:.8f} new={new_price:.8f}")
+                                    self._refresh_open_orders()
+                                    self._refresh_balances_only()
                 elif state == "EXIT_PENDING":
                     exit_order_id = cycle.get("exit_order_id")
                     if not exit_order_id:
@@ -1562,7 +1659,7 @@ Filters
 {self.filters_label.text()}
 
 Runtime
-app_version=0.2.1 uptime={int(now-self.started_at)}s current_mode={self.mode_label.text()} active_orders_count={self.runtime['active_orders_count']}
+app_version=0.2.3 uptime={int(now-self.started_at)}s current_mode={self.mode_label.text()} active_orders_count={self.runtime['active_orders_count']}
 cycles={self.runtime.get('cycle_stats',{}).get('total',0)} wins/losses={self.runtime.get('cycle_stats',{}).get('wins',0)}/{self.runtime.get('cycle_stats',{}).get('losses',0)} realized/unrealized_pnl={self.runtime['realized_pnl']}/{self.runtime['unrealized_pnl']} tick_capture={self.runtime['tick_capture']}
 last_order_error={self.runtime.get('last_order_error')}
 execution_cooldown_until={self.runtime.get('execution_cooldown_until')}
