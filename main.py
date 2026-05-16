@@ -38,7 +38,7 @@ CONFIG_PATH = Path(__file__).resolve().parent / "config" / "settings.json"
 
 def default_settings() -> dict:
         return {
-            "version": "0.2.0",
+            "version": "0.2.1",
         "binance_api_key": "",
         "binance_api_secret": "",
         "use_testnet": False,
@@ -385,7 +385,7 @@ class LUCTerminal(QMainWindow):
         self.settings = self._load_settings()
         self.thread: QThread | None = None
         self.worker: ConnectWorker | None = None
-        self.setWindowTitle("LUC v0.1.12 — Balance Refresh Fix + Smart Runtime Logging")
+        self.setWindowTitle("LUC v0.2.1 — Critical Runtime Schema Fix + Cycle Engine Stabilization")
         self.resize(1520, 920)
         self.runtime = self._default_runtime()
         self.log_file = self._open_log_file()
@@ -411,8 +411,8 @@ class LUCTerminal(QMainWindow):
         self.open_orders_timer.timeout.connect(self._refresh_open_orders)
         self._update_trading_button()
         self.last_status = {"api": "DISCONNECTED", "eur": "IDLE", "euri": "IDLE"}
-        self.runtime.update({"euri_poll_count": 0, "euri_stale_count": 0, "eur_ticks": [], "active_orders_count": 0, "cycles": 0, "wins": 0, "losses": 0, "realized_pnl": 0.0, "unrealized_pnl": 0.0, "tick_capture": 0})
-        self._append_log("[v0.1.12] GUI cockpit initialized")
+        self.runtime.update({"euri_poll_count": 0, "euri_stale_count": 0, "eur_ticks": [], "active_orders_count": 0, "realized_pnl": 0.0, "unrealized_pnl": 0.0, "tick_capture": 0})
+        self._append_log("[v0.2.1] GUI cockpit initialized")
         self._append_log("[STABILITY] hysteresis enabled")
         self._append_log("[THEME] dark theme enabled")
         self._append_log("[SAFETY] No market data yet. No trading actions.")
@@ -460,7 +460,8 @@ class LUCTerminal(QMainWindow):
             "last_error_log_times": {},
             "log_events": {},
             "order_status_by_id": {},
-            "cycles": {},
+            "cycles_map": {},
+            "cycle_stats": {"total": 0, "wins": 0, "losses": 0, "completed": 0},
             "next_cycle_id": 1,
             "order_to_cycle": {},
             "spread_ownership": "NEUTRAL",
@@ -502,7 +503,7 @@ class LUCTerminal(QMainWindow):
         return deep_merge(base, loaded)
 
     def _save_settings(self) -> None:
-        self.settings["version"] = "0.1.12"
+        self.settings["version"] = "0.2.1"
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
         with CONFIG_PATH.open("w", encoding="utf-8") as file:
             json.dump(self.settings, file, indent=2, ensure_ascii=False)
@@ -565,7 +566,7 @@ class LUCTerminal(QMainWindow):
         self.setCentralWidget(central)
 
         top = QHBoxLayout()
-        self.version_label = self._status_label("LUC VERSION: 0.1.12")
+        self.version_label = self._status_label("LUC VERSION: 0.2.1")
         self.api_status_label = self._status_label("API STATUS: DISCONNECTED")
         self.eur_status = self._status_label("EURUSDT STATUS: IDLE")
         self.euri_status = self._status_label("EURIUSDT STATUS: IDLE")
@@ -763,10 +764,14 @@ class LUCTerminal(QMainWindow):
             self.euri_ask.setText(f"{ask:.6f}")
             self.euri_spread.setText(str(self.runtime["euri"]["spread_ticks"]))
             self._set_market_status(self.euri_status, "EURIUSDT STATUS: LIVE", "euri")
-            self._recompute()
         except Exception as exc:  # noqa: BLE001
             self._set_market_status(self.euri_status, "EURIUSDT STATUS: ERROR", "euri")
             self._append_log(f"[ERROR] EURI poll failed: {exc}")
+            return
+        try:
+            self._recompute()
+        except Exception as exc:  # noqa: BLE001
+            self._append_log(f"[ERROR] recompute failed: {exc}")
 
     def _ticks(self, value: float) -> int:
         tick = float(self.settings.get("general", {}).get("tick_size", 0.0001))
@@ -789,7 +794,15 @@ class LUCTerminal(QMainWindow):
         if self.runtime.get("last_fair_gap_zone") != gap_zone:
             self._append_log(f"[DATA] fair_gap zone changed: {self.runtime.get('last_fair_gap_zone')} -> {gap_zone}")
             self.runtime["last_fair_gap_zone"] = gap_zone
-        self._update_decisions()
+        try:
+            self._update_decisions()
+        except Exception as exc:  # noqa: BLE001
+            self._append_log(f"[ERROR] decision update failed: {exc}")
+            return
+        try:
+            self._execute_auto_order()
+        except Exception as exc:  # noqa: BLE001
+            self._append_log(f"[ERROR] execution failed: {exc}")
 
     def _evaluate_inventory_zone(self, euri_total: float, usdt_total: float, euri_mid: float) -> tuple[str, float | None]:
         total_euri_equiv = euri_total + (usdt_total / max(euri_mid, 1e-9) if euri_mid > 0 else 0.0)
@@ -958,7 +971,6 @@ class LUCTerminal(QMainWindow):
         })
         self._refresh_mode_cards()
         self._log_decision_changes()
-        self._execute_auto_order()
 
     def _refresh_mode_cards(self) -> None:
         d = self.runtime["decision"]
@@ -1077,6 +1089,18 @@ class LUCTerminal(QMainWindow):
         self._update_trading_button()
 
     def _create_cycle(self, mode: str, entry_side: str, entry_price: float, qty: float, target_ticks: int) -> dict:
+        if not isinstance(self.runtime.get("cycles_map"), dict):
+            self.runtime["cycles_map"] = {}
+        if not isinstance(self.runtime.get("order_to_cycle"), dict):
+            self.runtime["order_to_cycle"] = {}
+        if not isinstance(self.runtime.get("failed_order_keys"), dict):
+            self.runtime["failed_order_keys"] = {}
+        if not isinstance(self.runtime.get("order_status_by_id"), dict):
+            self.runtime["order_status_by_id"] = {}
+        if not isinstance(self.runtime.get("log_events"), dict):
+            self.runtime["log_events"] = {}
+        if not isinstance(self.runtime.get("cycle_stats"), dict):
+            self.runtime["cycle_stats"] = {"total": 0, "wins": 0, "losses": 0, "completed": 0}
         cycle_id = str(self.runtime.get("next_cycle_id", 1))
         self.runtime["next_cycle_id"] = int(self.runtime.get("next_cycle_id", 1)) + 1
         tick = float(self.settings.get("general", {}).get("tick_size", 0.0001))
@@ -1097,7 +1121,9 @@ class LUCTerminal(QMainWindow):
             "created_ts": time.time(),
             "updated_ts": time.time(),
         }
-        self.runtime.setdefault("cycles", {})[cycle_id] = cycle
+        self.runtime.setdefault("cycles_map", {})[cycle_id] = cycle
+        self.runtime["last_cycle_created_ts"] = time.time()
+        self.runtime["cycle_stats"]["total"] = int(self.runtime.get("cycle_stats", {}).get("total", 0)) + 1
         self._append_log(f"[CYCLE] created {mode} #{cycle_id}")
         return cycle
 
@@ -1152,8 +1178,22 @@ class LUCTerminal(QMainWindow):
             self.runtime["last_execution_block_reason"] = "INVALID_PROPOSAL"
             return None
         self.runtime["last_execution_block_reason"] = "NONE"
-        cycle = self._create_cycle(cycle_mode, side, price, qty, target_ticks)
-        return self._preflight_order({"mode": mode, "cycle_id": cycle["cycle_id"], "side": side, "symbol": "EURIUSDT", "price": price, "qty": qty, "reason": reason, "target": target})
+        proposal = {"mode": mode, "cycle_mode": cycle_mode, "target_ticks": target_ticks, "side": side, "symbol": "EURIUSDT", "price": price, "qty": qty, "reason": reason, "target": target}
+        preflight = self._preflight_order(proposal)
+        if not preflight:
+            return None
+        last_created = float(self.runtime.get("last_cycle_created_ts", 0.0))
+        min_interval = float(self.settings.get("passive", {}).get("passive_cooldown_sec", 2))
+        if now - last_created < min_interval:
+            self.runtime["last_execution_block_reason"] = "CYCLE_CREATE_COOLDOWN"
+            return None
+        for c in self.runtime.get("cycles_map", {}).values():
+            if c.get("state") in {"ENTRY_PENDING", "ACTIVE"} and c.get("mode") == cycle_mode and c.get("entry_side") == side and abs(float(c.get("entry_price", 0.0)) - float(preflight["price"])) < 1e-12:
+                self.runtime["last_execution_block_reason"] = "DUPLICATE_ACTIVE_CYCLE"
+                return None
+        cycle = self._create_cycle(cycle_mode, side, float(preflight["price"]), float(preflight["qty"]), target_ticks)
+        preflight["cycle_id"] = cycle["cycle_id"]
+        return preflight
 
     @staticmethod
     def _round_down(value: float, step: float) -> float:
@@ -1242,8 +1282,8 @@ class LUCTerminal(QMainWindow):
                 resp = self.client.place_limit_sell(order["symbol"], order["qty"], order["price"])
             order_id = resp.get("orderId")
             cycle_id = order.get("cycle_id")
-            if cycle_id and cycle_id in self.runtime.get("cycles", {}):
-                c = self.runtime["cycles"][cycle_id]
+            if cycle_id and cycle_id in self.runtime.get("cycles_map", {}):
+                c = self.runtime["cycles_map"][cycle_id]
                 c["entry_order_id"] = order_id
                 c["state"] = "ENTRY_PENDING"
                 c["updated_ts"] = time.time()
@@ -1276,6 +1316,9 @@ class LUCTerminal(QMainWindow):
             return
         try:
             orders = self.client.get_open_orders("EURIUSDT")
+            if not isinstance(orders, list):
+                self._log_once_or_changed("open_orders_invalid_type", f"[ORDER] open orders invalid payload type: {type(orders).__name__}", 60)
+                orders = []
             prev_count = int(self.runtime.get("active_orders_count", 0))
             self.runtime["active_orders_count"] = len(orders)
             now_ms = int(time.time() * 1000)
@@ -1287,7 +1330,7 @@ class LUCTerminal(QMainWindow):
                     continue
                 order_id = str(o.get("orderId"))
                 cycle_id = self.runtime.get("order_to_cycle", {}).get(order_id, "-")
-                cycle = self.runtime.get("cycles", {}).get(cycle_id, {})
+                cycle = self.runtime.get("cycles_map", {}).get(cycle_id, {}) if cycle_id != "-" else {}
                 mode = cycle.get("mode", "-")
                 leg = "ENTRY" if cycle.get("entry_order_id") == o.get("orderId") else "EXIT" if cycle.get("exit_order_id") == o.get("orderId") else "-"
                 lines.append(f"{cycle_id} | {mode} | {leg} | {o.get('side')} | {o.get('price')} | {o.get('origQty')} | {status} | {age}s | {o.get('orderId')}")
@@ -1414,8 +1457,8 @@ Filters
 {self.filters_label.text()}
 
 Runtime
-app_version=0.1.12 uptime={int(now-self.started_at)}s current_mode={self.mode_label.text()} active_orders_count={self.runtime['active_orders_count']}
-cycles={self.runtime['cycles']} wins/losses={self.runtime['wins']}/{self.runtime['losses']} realized/unrealized_pnl={self.runtime['realized_pnl']}/{self.runtime['unrealized_pnl']} tick_capture={self.runtime['tick_capture']}
+app_version=0.2.1 uptime={int(now-self.started_at)}s current_mode={self.mode_label.text()} active_orders_count={self.runtime['active_orders_count']}
+cycles={self.runtime.get('cycle_stats',{}).get('total',0)} wins/losses={self.runtime.get('cycle_stats',{}).get('wins',0)}/{self.runtime.get('cycle_stats',{}).get('losses',0)} realized/unrealized_pnl={self.runtime['realized_pnl']}/{self.runtime['unrealized_pnl']} tick_capture={self.runtime['tick_capture']}
 last_order_error={self.runtime.get('last_order_error')}
 execution_cooldown_until={self.runtime.get('execution_cooldown_until')}
 last_block_reason={self.runtime.get('last_block_reason')}
