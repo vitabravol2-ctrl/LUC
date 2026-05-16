@@ -1,0 +1,23 @@
+{
+  "version": "0.1.0",
+  "ui": {
+    "latest_logs_rows": 200,
+    "theme": "dark"
+  },
+  "runtime": {
+    "poll_interval_sec": 1.0,
+    "max_open_cycles": 1
+  },
+  "trading": {
+    "order_size": 1.0,
+    "min_gap_ticks": 1,
+    "max_spread_ticks": 3,
+    "target_ticks": 1,
+    "max_hold_sec": 30
+  },
+  "inventory": {
+    "safe": 0.30,
+    "danger": 0.60,
+    "critical": 0.80
+  }
+}
