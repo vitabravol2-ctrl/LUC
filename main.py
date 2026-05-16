@@ -56,7 +56,12 @@ DEFAULT_SETTINGS = {
     "corridor_churn_threshold": 0.35,
     "parent_impulse_ticks": 6.0,
     "stale_after_sec": 12,
+    "micro_window": 40,
+    "refill_recovery_ticks": 1.0,
+    "spread_compressed_ticks": 1.2,
+    "spread_unstable_ticks": 4.0,
 }
+
 
 
 class MarketState(str, Enum):
@@ -206,6 +211,16 @@ class LUCWindow(QMainWindow):
         self.parent_mid_hist: deque[float] = deque(maxlen=history_size)
         self.child_mid_hist: deque[float] = deque(maxlen=history_size)
         self.gap_ticks_hist: deque[float] = deque(maxlen=history_size)
+        micro_window = int(self.settings.get("micro_window", 40))
+        self.spread_ticks_hist: deque[float] = deque(maxlen=micro_window)
+        self.refill_timings_hist: deque[float] = deque(maxlen=micro_window)
+        self.center_dev_hist: deque[float] = deque(maxlen=micro_window)
+        self.corridor_age_hist: deque[int] = deque(maxlen=micro_window)
+        self.state_age_hist: deque[int] = deque(maxlen=micro_window)
+        self._refill_drop_started_at: float | None = None
+        self._last_gap_sign: int = 0
+        self._state_duration = 0
+        self._last_micro_log: dict[str, str] = {}
         self.last_child_update_ts = 0.0
         self.current_state = MarketState.WAIT
         self.corridor_state = MarketState.WAIT
@@ -279,6 +294,10 @@ class LUCWindow(QMainWindow):
         ])
         self.state_labels = self.make_panel(grid, 2, 0, "Market State", [
             "current state", "corridor state", "trap readiness", "parent state", "stale state",
+        ])
+        self.micro_labels = self.make_panel(grid, 2, 1, "Microstructure", [
+            "equilibrium score", "passive viability", "trap survivability", "refill strength",
+            "spread state", "churn quality", "center stability", "mean reversion quality", "market class",
         ])
         layout.addLayout(grid)
 
@@ -430,6 +449,29 @@ class LUCWindow(QMainWindow):
             self.log(f"[STATE] {state.value}")
             self.current_state = state
 
+    def _micro_color(self, level: str) -> str:
+        level = level.upper()
+        if level in {"IDEAL", "HIGH", "GREEN", "SURVIVABLE", "CALM", "COMPRESSED", "STABLE", "GOOD"}:
+            return "#7CFC8A"
+        if level in {"NORMAL", "BLUE", "RECYCLING"}:
+            return "#6FA8FF"
+        if level in {"CAUTION", "MEDIUM", "ORANGE", "EXPANDING"}:
+            return "#FFB366"
+        if level in {"DANGEROUS", "LOW", "RED", "UNSTABLE", "BROKEN", "AGGRESSIVE"}:
+            return "#FF6E6E"
+        return "#b7bdc8"
+
+    def _set_micro_label(self, name: str, value: str, level: str) -> None:
+        label = self.micro_labels[name]
+        label.setText(value)
+        label.setStyleSheet(f"color: {self._micro_color(level)}; font-weight: bold;")
+
+    def _log_micro_change(self, key: str, message: str) -> None:
+        prev = self._last_micro_log.get(key)
+        if prev != message:
+            self._last_micro_log[key] = message
+            self.log(f"[MICRO] {message}")
+
     def refresh_view(self) -> None:
         parent_mid = (self.parent_bid + self.parent_ask) / 2 if self.parent_bid and self.parent_ask else 0.0
         child_mid = (self.child_bid + self.child_ask) / 2 if self.child_bid and self.child_ask else 0.0
@@ -464,6 +506,22 @@ class LUCWindow(QMainWindow):
         gap_amplitude = (max(recent_gap) - min(recent_gap)) if recent_gap else 0.0
         sign_changes = sum(1 for i in range(1, len(recent_gap)) if recent_gap[i - 1] * recent_gap[i] < 0)
         churn = sign_changes / max(1, len(recent_gap) - 1)
+
+        self.spread_ticks_hist.append(spread_ticks)
+        self.center_dev_hist.append(abs(gap_center))
+        self.corridor_age_hist.append(corridor_age)
+        if gap_ticks > 0:
+            gap_sign = 1
+        elif gap_ticks < 0:
+            gap_sign = -1
+        else:
+            gap_sign = 0
+        if self._last_gap_sign and gap_sign and gap_sign != self._last_gap_sign:
+            self._refill_drop_started_at = now_ts
+        if self._refill_drop_started_at is not None and abs(gap_ticks) <= float(self.settings.get("refill_recovery_ticks", 1.0)):
+            self.refill_timings_hist.append(now_ts - self._refill_drop_started_at)
+            self._refill_drop_started_at = None
+        self._last_gap_sign = gap_sign
 
         stable_move = float(self.settings.get("corridor_move_ticks", 3.0))
         stable_center = float(self.settings.get("corridor_center_tolerance_ticks", 1.5))
@@ -506,6 +564,43 @@ class LUCWindow(QMainWindow):
         if self.trap_readiness in (MarketState.BUY_TRAP_READY, MarketState.SELL_TRAP_READY, MarketState.PASSIVE):
             state = self.trap_readiness
 
+        avg_spread = sum(self.spread_ticks_hist) / len(self.spread_ticks_hist) if self.spread_ticks_hist else spread_ticks
+        spread_var = (max(self.spread_ticks_hist) - min(self.spread_ticks_hist)) if self.spread_ticks_hist else 0.0
+        center_stability = max(0, min(100, int(100 - (abs(gap_center) * 20 + gap_amplitude * 10))))
+        mean_reversion_quality = max(0, min(100, int(100 - min(100, abs(gap_ticks) * 15) - churn * 25)))
+        equilibrium_score = max(0, min(100, int((center_stability * 0.45) + ((100 - min(100, gap_amplitude * 18)) * 0.35) + ((100 - min(100, churn * 160)) * 0.20))))
+        passive_viability = max(0, min(100, int((100 - min(100, avg_spread * 18)) * 0.4 + equilibrium_score * 0.35 + (100 - min(100, parent_vol_ticks * 8)) * 0.25)))
+        trap_survivability = max(0, min(100, int((100 if corridor_stable else 35) * 0.35 + (100 - min(100, spread_ticks * 22)) * 0.2 + (100 - min(100, parent_vol_ticks * 10)) * 0.2 + mean_reversion_quality * 0.25)))
+
+        refill_avg = sum(self.refill_timings_hist) / len(self.refill_timings_hist) if self.refill_timings_hist else 2.4
+        if refill_avg <= 0.9:
+            refill_strength = "AGGRESSIVE_REFILL"
+        elif refill_avg <= 1.9:
+            refill_strength = "NORMAL_REFILL"
+        else:
+            refill_strength = "WEAK_REFILL"
+
+        if spread_var >= 2.0 or spread_ticks >= float(self.settings.get("spread_unstable_ticks", 4.0)):
+            spread_state = "UNSTABLE"
+        elif spread_ticks <= float(self.settings.get("spread_compressed_ticks", 1.2)):
+            spread_state = "COMPRESSED"
+        elif spread_ticks > max_spread_ticks:
+            spread_state = "EXPANDING"
+        else:
+            spread_state = "NORMAL"
+
+        if churn >= 0.55:
+            churn_quality = "CHAOTIC"
+        elif churn >= 0.25:
+            churn_quality = "RECYCLING"
+        else:
+            churn_quality = "CALM"
+
+        market_class = "IDEAL_MARKET" if (spread_state in {"COMPRESSED", "NORMAL"} and refill_strength == "WEAK_REFILL" and equilibrium_score >= 70 and passive_viability >= 70) else "DANGEROUS_MARKET" if (spread_state == "UNSTABLE" or self.parent_state == MarketState.PARENT_IMPULSE or refill_strength == "AGGRESSIVE_REFILL" or mean_reversion_quality < 45) else "CAUTION_MARKET"
+
+        self._state_duration = self._state_duration + 1 if state == self.current_state else 1
+        self.state_age_hist.append(self._state_duration)
+
         self._log_state_change(state)
 
         self.lbl_app.setText(f"APP STATUS: {self.app_status}")
@@ -539,6 +634,22 @@ class LUCWindow(QMainWindow):
         self._set_state_label("trap readiness", self.trap_readiness)
         self._set_state_label("parent state", self.parent_state)
         self._set_state_label("stale state", self.stale_state)
+
+        self._set_micro_label("equilibrium score", f"{equilibrium_score}", "HIGH" if equilibrium_score >= 70 else "MEDIUM" if equilibrium_score >= 45 else "LOW")
+        self._set_micro_label("passive viability", f"{passive_viability}", "HIGH" if passive_viability >= 70 else "MEDIUM" if passive_viability >= 45 else "LOW")
+        self._set_micro_label("trap survivability", f"{trap_survivability}", "SURVIVABLE" if trap_survivability >= 65 else "CAUTION" if trap_survivability >= 45 else "DANGEROUS")
+        self._set_micro_label("refill strength", refill_strength, "RED" if refill_strength == "AGGRESSIVE_REFILL" else "NORMAL" if refill_strength == "NORMAL_REFILL" else "GREEN")
+        self._set_micro_label("spread state", spread_state, spread_state)
+        self._set_micro_label("churn quality", churn_quality, "CALM" if churn_quality == "CALM" else "RECYCLING" if churn_quality == "RECYCLING" else "DANGEROUS")
+        self._set_micro_label("center stability", f"{center_stability}", "HIGH" if center_stability >= 70 else "MEDIUM" if center_stability >= 45 else "LOW")
+        self._set_micro_label("mean reversion quality", f"{mean_reversion_quality}", "HIGH" if mean_reversion_quality >= 70 else "MEDIUM" if mean_reversion_quality >= 45 else "BROKEN")
+        self._set_micro_label("market class", market_class, "GREEN" if market_class == "IDEAL_MARKET" else "RED" if market_class == "DANGEROUS_MARKET" else "ORANGE")
+
+        self._log_micro_change("eq", f"equilibrium={equilibrium_score} passive={passive_viability} class={market_class}")
+        self._log_micro_change("refill", f"refill={refill_strength}")
+        self._log_micro_change("trap", f"trap_survivability={trap_survivability}")
+        if market_class == "DANGEROUS_MARKET":
+            self._log_micro_change("danger", "dangerous_market")
 
         self.inventory_labels["EURI balance"].setText("1000.00")
         self.inventory_labels["USDT balance"].setText("1000.00")
