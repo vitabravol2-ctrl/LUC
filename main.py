@@ -37,7 +37,7 @@ CONFIG_PATH = Path(__file__).resolve().parent / "config" / "settings.json"
 
 def default_settings() -> dict:
     return {
-        "version": "0.1.6",
+        "version": "0.1.7",
         "binance_api_key": "",
         "binance_api_secret": "",
         "use_testnet": False,
@@ -56,6 +56,10 @@ def default_settings() -> dict:
             "euri_stale_ms": 10000,
             "status_hysteresis_ms": 3000,
             "tick_size": 0.0001,
+            "trading_enabled": False,
+            "require_order_confirmation": True,
+            "max_live_order_size": 100.0,
+            "allow_auto_orders": True,
         },
         "passive": {
             "passive_enabled": True,
@@ -156,6 +160,19 @@ class BinanceClient:
         return symbols[0]
 
 
+
+
+    def place_limit_buy(self, symbol: str, qty: float, price: float) -> dict:
+        return self._request("POST", "/api/v3/order", params={"symbol": symbol, "side": "BUY", "type": "LIMIT", "timeInForce": "GTC", "quantity": f"{qty:.8f}", "price": f"{price:.8f}"}, signed=True)
+
+    def place_limit_sell(self, symbol: str, qty: float, price: float) -> dict:
+        return self._request("POST", "/api/v3/order", params={"symbol": symbol, "side": "SELL", "type": "LIMIT", "timeInForce": "GTC", "quantity": f"{qty:.8f}", "price": f"{price:.8f}"}, signed=True)
+
+    def cancel_order(self, symbol: str, order_id: int) -> dict:
+        return self._request("DELETE", "/api/v3/order", params={"symbol": symbol, "orderId": order_id}, signed=True)
+
+    def get_open_orders(self, symbol: str) -> list:
+        return self._request("GET", "/api/v3/openOrders", params={"symbol": symbol}, signed=True)
 class ConnectWorker(QObject):
     log = Signal(str)
     status = Signal(str)
@@ -353,7 +370,7 @@ class LUCTerminal(QMainWindow):
         self.settings = self._load_settings()
         self.thread: QThread | None = None
         self.worker: ConnectWorker | None = None
-        self.setWindowTitle("LUC v0.1.6 — Decision Stability + Dark Theme")
+        self.setWindowTitle("LUC v0.1.7 — Auto Trading Gate + Confirmation")
         self.resize(1520, 920)
         self.runtime = self._default_runtime()
         self.log_file = self._open_log_file()
@@ -368,9 +385,13 @@ class LUCTerminal(QMainWindow):
         self.eur_watchdog.timeout.connect(self._update_market_status)
         self.eur_watchdog.start(1000)
         self.started_at = time.time()
+        self.client: BinanceClient | None = None
+        self.open_orders_timer = QTimer(self)
+        self.open_orders_timer.timeout.connect(self._refresh_open_orders)
+        self._update_trading_button()
         self.last_status = {"api": "DISCONNECTED", "eur": "IDLE", "euri": "IDLE"}
         self.runtime.update({"euri_poll_count": 0, "euri_stale_count": 0, "eur_ticks": [], "active_orders_count": 0, "cycles": 0, "wins": 0, "losses": 0, "realized_pnl": 0.0, "unrealized_pnl": 0.0, "tick_capture": 0})
-        self._append_log("[v0.1.6] GUI cockpit initialized")
+        self._append_log("[v0.1.7] GUI cockpit initialized")
         self._append_log("[STABILITY] hysteresis enabled")
         self._append_log("[THEME] dark theme enabled")
         self._append_log("[SAFETY] No market data yet. No trading actions.")
@@ -419,7 +440,7 @@ class LUCTerminal(QMainWindow):
         return deep_merge(base, loaded)
 
     def _save_settings(self) -> None:
-        self.settings["version"] = "0.1.6"
+        self.settings["version"] = "0.1.7"
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
         with CONFIG_PATH.open("w", encoding="utf-8") as file:
             json.dump(self.settings, file, indent=2, ensure_ascii=False)
@@ -455,7 +476,7 @@ class LUCTerminal(QMainWindow):
         self.setCentralWidget(central)
 
         top = QHBoxLayout()
-        self.version_label = self._status_label("LUC VERSION: 0.1.6")
+        self.version_label = self._status_label("LUC VERSION: 0.1.7")
         self.api_status_label = self._status_label("API STATUS: DISCONNECTED")
         self.eur_status = self._status_label("EURUSDT STATUS: IDLE")
         self.euri_status = self._status_label("EURIUSDT STATUS: IDLE")
@@ -495,8 +516,12 @@ class LUCTerminal(QMainWindow):
 
         orders = QGroupBox("Active Orders")
         ol = QVBoxLayout(orders)
-        ol.addWidget(QLabel("side | price | qty | status | age | reason"))
-        ol.addWidget(QLabel("No active orders (placeholder)."))
+        ol.addWidget(QLabel("side | price | qty | status | age | reason | orderId"))
+        self.active_orders_view = QPlainTextEdit()
+        self.active_orders_view.setReadOnly(True)
+        self.active_orders_view.setMaximumHeight(130)
+        self.active_orders_view.setPlainText("No active orders.")
+        ol.addWidget(self.active_orders_view)
 
         lower.addWidget(market, 0, 0)
         lower.addWidget(acc, 0, 1)
@@ -512,6 +537,10 @@ class LUCTerminal(QMainWindow):
         root.addWidget(logs_box)
 
         buttons = QHBoxLayout()
+        self.trading_btn = QPushButton("START TRADING")
+        self.trading_btn.setMinimumWidth(180)
+        self.trading_btn.clicked.connect(self._toggle_trading)
+        buttons.addWidget(self.trading_btn)
         buttons.addStretch(1)
         self.menu_btn = QPushButton("MENU")
         self.menu_btn.setMinimumWidth(160)
@@ -555,6 +584,9 @@ class LUCTerminal(QMainWindow):
             self.last_status["api"] = status
 
     def _apply_connect_result(self, payload: dict) -> None:
+        if not self.client:
+            self.client = BinanceClient(self.settings.get("binance_api_key", ""), self.settings.get("binance_api_secret", ""), bool(self.settings.get("use_testnet", False)))
+            self.open_orders_timer.start(4000)
         balances = payload.get("balances", {})
         euri = balances.get("EURI", {"free": 0, "locked": 0, "total": 0})
         usdt = balances.get("USDT", {"free": 0, "locked": 0, "total": 0})
@@ -772,6 +804,7 @@ class LUCTerminal(QMainWindow):
         })
         self._refresh_mode_cards()
         self._log_decision_changes()
+        self._execute_auto_order()
 
     def _refresh_mode_cards(self) -> None:
         d = self.runtime["decision"]
@@ -866,6 +899,106 @@ class LUCTerminal(QMainWindow):
             elif current == "STALE" and age_ms < stale_ms:
                 self._set_market_status(label, prefix + "LIVE", key)
 
+
+    def _update_trading_button(self) -> None:
+        enabled = bool(self.settings.get("general", {}).get("trading_enabled", False))
+        self.trading_btn.setText("STOP TRADING" if enabled else "START TRADING")
+
+    def _toggle_trading(self) -> None:
+        general = self.settings.setdefault("general", {})
+        general["trading_enabled"] = not bool(general.get("trading_enabled", False))
+        self._save_settings()
+        state = "enabled" if general["trading_enabled"] else "disabled"
+        self._append_log(f"[TRADING] trading {state}")
+        self._update_trading_button()
+
+    def _prepare_order(self) -> dict | None:
+        d = self.runtime.get("decision", {})
+        general = self.settings.get("general", {})
+        trap = self.settings.get("trap", {})
+        passive = self.settings.get("passive", {})
+        risk = self.settings.get("risk_inventory", {})
+        euri = self.runtime.get("euri", {})
+        if not bool(general.get("trading_enabled", False)) or not bool(general.get("allow_auto_orders", True)):
+            return None
+        if d.get("current_mode") == "WAIT" or self.runtime.get("active_orders_count", 0) > 0 or not d.get("data_fresh"):
+            return None
+        if not bool(risk.get("no_market_orders", True)):
+            return None
+        mode = d.get("current_mode")
+        side = None
+        qty = 0.0
+        price = 0.0
+        reason = ""
+        target = ""
+        if mode == "AGGRESSIVE_TRAP":
+            if d.get("trap_direction") == "BUY_TRAP":
+                side, qty, price, reason, target = "BUY", float(trap.get("trap_order_size", 1.0)), float(euri.get("ask", 0.0)), "BUY_TRAP fair_gap", "SELL +1 tick"
+            elif d.get("trap_direction") == "SELL_TRAP":
+                free = self._parse_free(self.euri_bal.text())
+                side, qty, price, reason, target = "SELL", min(float(trap.get("trap_order_size", 1.0)), free), float(euri.get("bid", 0.0)), "SELL_TRAP fair_gap", "BUY -1 tick"
+        elif mode == "PASSIVE_CORRIDOR":
+            side, qty, price, reason, target = "BUY", float(passive.get("passive_order_size", 1.0)), float(euri.get("bid", 0.0)), "PASSIVE_CORRIDOR recycle", "sell corridor"
+        if not side or qty <= 0 or price <= 0:
+            return None
+        notional = qty * price
+        if notional > float(general.get("max_live_order_size", 100.0)):
+            return None
+        return {"mode": mode, "side": side, "symbol": "EURIUSDT", "price": price, "qty": qty, "notional": notional, "reason": reason, "target": target}
+
+    def _confirm_order(self, order: dict) -> bool:
+        d = self.runtime.get("decision", {})
+        text = (f"Подтвердить ордер?\n- Mode: {order['mode']}\n- Action: {order['side']}\n- Symbol: {order['symbol']}\n- Price: {order['price']:.6f}\n- Qty: {order['qty']:.6f}\n- Notional: {order['notional']:.6f}\n- Reason: {order['reason']}\n- Expected target: {order['target']}\n- Current fair gap ticks: {d.get('fair_gap_ticks')}\n- Spread ticks: {d.get('euri_spread_ticks')}\n- Inventory zone: {d.get('inventory_zone')}")
+        result = QMessageBox.question(self, "Order Confirmation", text, QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel, QMessageBox.StandardButton.Cancel)
+        if result != QMessageBox.StandardButton.Ok:
+            self._append_log("[ORDER] canceled by user confirmation.")
+            return False
+        self._append_log("[ORDER] confirmation accepted")
+        return True
+
+    def _execute_auto_order(self) -> None:
+        order = self._prepare_order()
+        if not order:
+            return
+        self._append_log(f"[ORDER] proposed order: {order['side']} {order['qty']:.6f} {order['symbol']} @ {order['price']:.6f} ({order['reason']})")
+        if bool(self.settings.get("general", {}).get("require_order_confirmation", True)) and not self._confirm_order(order):
+            return
+        try:
+            if not self.client:
+                return
+            if order["side"] == "BUY":
+                resp = self.client.place_limit_buy(order["symbol"], order["qty"], order["price"])
+            else:
+                resp = self.client.place_limit_sell(order["symbol"], order["qty"], order["price"])
+            self._append_log(f"[ORDER] order sent id={resp.get('orderId')}")
+            self._refresh_open_orders()
+            self._connect_api()
+        except Exception as exc:
+            self._append_log(f"[ORDER] order error: {exc}")
+
+    @staticmethod
+    def _parse_free(text: str) -> float:
+        try:
+            return float(text.split("free=")[1].split(" /")[0])
+        except Exception:
+            return 0.0
+
+    def _refresh_open_orders(self) -> None:
+        if not self.client:
+            return
+        try:
+            orders = self.client.get_open_orders("EURIUSDT")
+            self.runtime["active_orders_count"] = len(orders)
+            now_ms = int(time.time() * 1000)
+            lines = []
+            for o in orders[:1]:
+                age = max(0, (now_ms - int(o.get("time", now_ms))) // 1000)
+                lines.append(f"{o.get('side')} | {o.get('price')} | {o.get('origQty')} | {o.get('status')} | {age}s | {o.get('clientOrderId','')} | {o.get('orderId')}")
+            self.active_orders_view.setPlainText("\n".join(lines) if lines else "No active orders.")
+            self._append_log("[ORDER] open orders refreshed")
+        except Exception as exc:
+            self._append_log(f"[ORDER] open orders refresh error: {exc}")
+
     def _show_all_data(self):
         AllDataDialog(self).exec()
 
@@ -936,7 +1069,7 @@ Filters
 {self.filters_label.text()}
 
 Runtime
-app_version=0.1.6 uptime={int(now-self.started_at)}s current_mode={self.mode_label.text()} active_orders_count={self.runtime['active_orders_count']}
+app_version=0.1.7 uptime={int(now-self.started_at)}s current_mode={self.mode_label.text()} active_orders_count={self.runtime['active_orders_count']}
 cycles={self.runtime['cycles']} wins/losses={self.runtime['wins']}/{self.runtime['losses']} realized/unrealized_pnl={self.runtime['realized_pnl']}/{self.runtime['unrealized_pnl']} tick_capture={self.runtime['tick_capture']}
 
 Decision Engine
