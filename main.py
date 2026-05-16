@@ -4,6 +4,7 @@ import os
 import sys
 import threading
 import time
+import random
 from collections import deque
 from enum import Enum
 from datetime import datetime
@@ -78,7 +79,17 @@ DEFAULT_SETTINGS = {
     "paper_min_hold_sec": 4.0,
     "paper_cycle_cooldown_sec": 7.0,
     "paper_max_cycles_per_min": 8,
+    "budget_total": 2000.0,
+    "budget_passive": 800.0,
+    "budget_traps": 700.0,
+    "budget_anchor": 500.0,
+    "budget_max_one_side": 1000.0,
+    "sizing_min_order_size": 10.0,
+    "sizing_max_order_size": 200.0,
+    "sizing_randomize": True,
+    "sizing_random_factor_pct": 20.0,
 }
+
 
 
 
@@ -127,11 +138,11 @@ class CycleState(str, Enum):
 class BasicSettingsDialog(QDialog):
     def __init__(self, settings: dict[str, Any], parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("LUC Basic Settings")
+        self.setWindowTitle("LUC Базовые настройки")
         self.setModal(True)
-        self.resize(380, 280)
+        self.resize(520, 620)
 
-        form = QFormLayout(self)
+        root = QVBoxLayout(self)
 
         self.dry_run = QCheckBox()
         self.dry_run.setChecked(bool(settings.get("DRY_RUN", True)))
@@ -158,21 +169,70 @@ class BasicSettingsDialog(QDialog):
         self.max_inventory_shift.setDecimals(4)
         self.max_inventory_shift.setValue(float(settings.get("max_inventory_shift", 300.0)))
 
-        form.addRow("DRY_RUN", self.dry_run)
-        form.addRow("order_size", self.order_size)
-        form.addRow("min_gap_ticks", self.min_gap_ticks)
-        form.addRow("max_spread_ticks", self.max_spread_ticks)
-        form.addRow("cooldown", self.cooldown)
-        form.addRow("max_inventory_shift", self.max_inventory_shift)
+        self.budget_total = QDoubleSpinBox()
+        self.budget_total.setRange(0.0, 10_000_000.0)
+        self.budget_total.setDecimals(2)
+        self.budget_total.setValue(float(settings.get("budget_total", 2000.0)))
+
+        self.budget_passive = QDoubleSpinBox()
+        self.budget_passive.setRange(0.0, 10_000_000.0)
+        self.budget_passive.setDecimals(2)
+        self.budget_passive.setValue(float(settings.get("budget_passive", 800.0)))
+
+        self.budget_traps = QDoubleSpinBox()
+        self.budget_traps.setRange(0.0, 10_000_000.0)
+        self.budget_traps.setDecimals(2)
+        self.budget_traps.setValue(float(settings.get("budget_traps", 700.0)))
+
+        self.budget_anchor = QDoubleSpinBox()
+        self.budget_anchor.setRange(0.0, 10_000_000.0)
+        self.budget_anchor.setDecimals(2)
+        self.budget_anchor.setValue(float(settings.get("budget_anchor", 500.0)))
+
+        self.budget_max_one_side = QDoubleSpinBox()
+        self.budget_max_one_side.setRange(0.0, 10_000_000.0)
+        self.budget_max_one_side.setDecimals(2)
+        self.budget_max_one_side.setValue(float(settings.get("budget_max_one_side", 1000.0)))
+
+        self.sizing_min_order_size = QDoubleSpinBox()
+        self.sizing_min_order_size.setRange(0.0, 1_000_000.0)
+        self.sizing_min_order_size.setDecimals(4)
+        self.sizing_min_order_size.setValue(float(settings.get("sizing_min_order_size", 10.0)))
+
+        self.sizing_max_order_size = QDoubleSpinBox()
+        self.sizing_max_order_size.setRange(0.0, 1_000_000.0)
+        self.sizing_max_order_size.setDecimals(4)
+        self.sizing_max_order_size.setValue(float(settings.get("sizing_max_order_size", 200.0)))
+
+        self.sizing_randomize = QCheckBox()
+        self.sizing_randomize.setChecked(bool(settings.get("sizing_randomize", True)))
+
+        self.sizing_random_factor_pct = QDoubleSpinBox()
+        self.sizing_random_factor_pct.setRange(0.0, 100.0)
+        self.sizing_random_factor_pct.setDecimals(1)
+        self.sizing_random_factor_pct.setValue(float(settings.get("sizing_random_factor_pct", 20.0)))
+
+        sections = [
+            ("Основное", [("Сухой режим", self.dry_run), ("Базовый размер ордера", self.order_size), ("Мин. gap в тиках", self.min_gap_ticks), ("Макс. спред", self.max_spread_ticks)]),
+            ("Бюджет", [("Общий бюджет", self.budget_total), ("Бюджет passive", self.budget_passive), ("Бюджет traps", self.budget_traps), ("Бюджет anchor", self.budget_anchor), ("Максимум в одной стороне", self.budget_max_one_side)]),
+            ("Размер ставки", [("Мин. размер ордера", self.sizing_min_order_size), ("Макс. размер ордера", self.sizing_max_order_size), ("Randomize size", self.sizing_randomize), ("Random factor %", self.sizing_random_factor_pct)]),
+            ("Риск", [("Cooldown сигнала", self.cooldown), ("Макс. inventory skew", self.max_inventory_shift), ("Critical inventory skew", QLabel(str(settings.get("paper_critical_skew_pct", 55.0)))), ("Max open cycles", QLabel(str(settings.get("paper_max_open_cycles", 1)))), ("Max cycles/min", QLabel(str(settings.get("paper_max_cycles_per_min", 8))))]),
+        ]
+        for title, rows in sections:
+            box = QGroupBox(title)
+            form = QFormLayout(box)
+            for name, widget in rows:
+                form.addRow(name, widget)
+            root.addWidget(box)
 
         buttons = QHBoxLayout()
-        apply_btn = QPushButton("Apply")
-        cancel_btn = QPushButton("Cancel")
+        apply_btn = QPushButton("Применить")
+        cancel_btn = QPushButton("Отмена")
         apply_btn.clicked.connect(self.accept)
         cancel_btn.clicked.connect(self.reject)
         buttons.addWidget(apply_btn)
         buttons.addWidget(cancel_btn)
-        form.addRow(buttons)
+        root.addLayout(buttons)
 
     def values(self) -> dict[str, Any]:
         return {
@@ -182,6 +242,15 @@ class BasicSettingsDialog(QDialog):
             "max_spread_ticks": self.max_spread_ticks.value(),
             "cooldown": self.cooldown.value(),
             "max_inventory_shift": self.max_inventory_shift.value(),
+            "budget_total": self.budget_total.value(),
+            "budget_passive": self.budget_passive.value(),
+            "budget_traps": self.budget_traps.value(),
+            "budget_anchor": self.budget_anchor.value(),
+            "budget_max_one_side": self.budget_max_one_side.value(),
+            "sizing_min_order_size": self.sizing_min_order_size.value(),
+            "sizing_max_order_size": self.sizing_max_order_size.value(),
+            "sizing_randomize": self.sizing_randomize.isChecked(),
+            "sizing_random_factor_pct": self.sizing_random_factor_pct.value(),
         }
 
 
@@ -333,6 +402,8 @@ class LUCWindow(QMainWindow):
         self.paper_fill_quality = 0
         self.paper_cycle_timestamps: deque[float] = deque(maxlen=120)
         self._last_warn_log: dict[str, float] = {}
+        self.current_sizing: dict[str, Any] = {}
+        self._last_sizing_logged: dict[str, float] = {}
 
         self.setup_logger()
         self.build_ui()
@@ -419,6 +490,11 @@ class LUCWindow(QMainWindow):
         self.log_box.setMaximumBlockCount(600)
         layout.addWidget(self.log_box, 1)
 
+        self.sizing_labels = self.make_panel(grid, 4, 0, "Sizing / Budget", [
+            "recommended passive size", "recommended trap size", "recommended anchor layer 1", "recommended anchor layer 2", "recommended anchor layer 3",
+            "budget used %", "inventory factor", "random factor", "active sizing mode",
+        ])
+
         self.ledger_labels = self.make_panel(grid, 3, 1, "Ledger Last Events", [
             "event 1", "event 2", "event 3", "event 4", "event 5", "event 6", "event 7", "event 8",
         ])
@@ -428,6 +504,7 @@ class LUCWindow(QMainWindow):
         grid.setRowStretch(1, 3)
         grid.setRowStretch(2, 2)
         grid.setRowStretch(3, 2)
+        grid.setRowStretch(4, 2)
 
     def make_panel(self, grid: QGridLayout, row: int, col: int, title: str, fields: list[str]) -> dict[str, QLabel]:
         box = QGroupBox(title)
@@ -803,6 +880,34 @@ class LUCWindow(QMainWindow):
         self.log(f"[PAPER] close {source_name} {close_side} qty={closed_qty:.2f} price={close_price:.4f} pnl={pnl:+.4f}")
         self._paper_log("recycle", f"[PAPER] cycle closed pnl={pnl:+.4f} ticks={ticks:+.2f}")
 
+
+    def _calc_inventory_factor(self, skew: float, side: str, danger_skew: float, critical_skew: float) -> float:
+        abs_skew = abs(skew)
+        if abs_skew >= critical_skew:
+            if (side == "BUY" and skew > 0) or (side == "SELL" and skew < 0):
+                return 0.0
+            return 0.35
+        if abs_skew >= danger_skew:
+            return 0.5
+        return 1.0
+
+    def _compute_sizing(self, *, mode: str, side: str, regime: Regime, gap_ticks: float, trap_survivability: int, skew: float, danger_skew: float, critical_skew: float) -> dict[str, float]:
+        base_size = float(self.settings.get("paper_order_size_euri", self.settings.get("order_size", 50.0)))
+        regime_factor_map = {Regime.IDEAL_PASSIVE: 1.0, Regime.IDEAL_TRAP: 1.2, Regime.NEUTRAL: 0.5, Regime.CAUTION: 0.25, Regime.DANGEROUS: 0.0, Regime.ESCAPE: 0.0}
+        regime_factor = regime_factor_map.get(regime, 0.5)
+        ag = abs(gap_ticks)
+        gap_factor = 0.7 if ag < 1.5 else 1.0 if ag < 4.0 else 1.3
+        mode_factor = 0.7 if mode == "PASSIVE" else 1.0 if mode in {"BUY_TRAP", "SELL_TRAP"} else 1.2
+        inventory_factor = self._calc_inventory_factor(skew, side, danger_skew, critical_skew)
+        trap_factor = max(0.6, min(1.2, trap_survivability / 100.0 + 0.2)) if "TRAP" in mode else 1.0
+        random_pct = float(self.settings.get("sizing_random_factor_pct", 20.0)) / 100.0
+        random_factor = random.uniform(1.0 - random_pct, 1.0 + random_pct) if self.settings.get("sizing_randomize", True) else 1.0
+        size = base_size * regime_factor * gap_factor * mode_factor * inventory_factor * trap_factor * random_factor
+        min_size = float(self.settings.get("sizing_min_order_size", 10.0))
+        max_size = float(self.settings.get("sizing_max_order_size", 200.0))
+        size = max(min_size, min(max_size, size))
+        return {"size": size, "inventory_factor": inventory_factor, "random_factor": random_factor, "mode": mode}
+
     def _paper_step(self, *, now_ts: float, child_mid: float, gap_ticks: float, spread_ticks: float, parent_dir: str, regime: Regime, passive_viability: int, trap_survivability: int, refill_strength: str, churn_quality: str, child_stale_sec: float) -> None:
         if child_mid <= 0:
             return
@@ -816,6 +921,25 @@ class LUCWindow(QMainWindow):
         critical_skew = float(self.settings.get("paper_critical_skew_pct", 55.0))
         max_cycles_per_min = int(self.settings.get("paper_max_cycles_per_min", 8))
         total_value, skew, start_value, unrealized = self._inventory_metrics(child_mid)
+        sizing_passive = self._compute_sizing(mode="PASSIVE", side="BUY", regime=regime, gap_ticks=gap_ticks, trap_survivability=trap_survivability, skew=skew, danger_skew=danger_skew, critical_skew=critical_skew)
+        sizing_trap_buy = self._compute_sizing(mode="BUY_TRAP", side="BUY", regime=regime, gap_ticks=gap_ticks, trap_survivability=trap_survivability, skew=skew, danger_skew=danger_skew, critical_skew=critical_skew)
+        sizing_trap_sell = self._compute_sizing(mode="SELL_TRAP", side="SELL", regime=regime, gap_ticks=gap_ticks, trap_survivability=trap_survivability, skew=skew, danger_skew=danger_skew, critical_skew=critical_skew)
+        self.current_sizing = {"passive": sizing_passive, "trap_buy": sizing_trap_buy, "trap_sell": sizing_trap_sell}
+        for key, value in {
+            "passive": sizing_passive["size"],
+            "trap": max(sizing_trap_buy["size"], sizing_trap_sell["size"]),
+            "anchor_layers": float(self.settings.get("budget_anchor", 0.0)),
+        }.items():
+            prev = self._last_sizing_logged.get(key)
+            if prev is None or (prev > 0 and abs(value - prev) / prev >= 0.12):
+                if key == "anchor_layers":
+                    a1 = min(value * 0.20, float(self.settings.get("sizing_max_order_size", 200.0)))
+                    a2 = min(value * 0.30, float(self.settings.get("sizing_max_order_size", 200.0)))
+                    a3 = min(value * 0.50, float(self.settings.get("sizing_max_order_size", 200.0)))
+                    self.log(f"[SIZING] anchor_layers={a1:.2f}/{a2:.2f}/{a3:.2f}")
+                else:
+                    self.log(f"[SIZING] {key}={value:.2f}")
+                self._last_sizing_logged[key] = value
         self.paper_cycle_mae = min(self.paper_cycle_mae, unrealized)
         self.paper_fill_quality = max(0, min(100, int(
             (100 if child_stale_sec <= 2.5 else 45) * 0.25
@@ -911,6 +1035,8 @@ class LUCWindow(QMainWindow):
                 if self.paper_fill_delay_left > 1:
                     self.paper_fill_delay_left -= 1
                     return
+                qty = sizing_passive["size"]
+                qty = sizing_trap_sell["size"]
                 self.paper_entry_price = self.child_bid
                 self.paper_usdt -= qty * self.paper_entry_price
                 self.paper_euri += qty
@@ -928,6 +1054,7 @@ class LUCWindow(QMainWindow):
                     self.log(f"[PAPER] open PASSIVE BUY qty={qty:.2f} price={self.paper_entry_price:.4f}")
         elif regime == Regime.IDEAL_TRAP and trap_survivability >= min_trap and gap_ticks >= min_gap_ticks and parent_dir == "UP":
             if self.paper_usdt >= qty * self.child_ask and self._can_open_new_cycle():
+                qty = sizing_trap_buy["size"]
                 self.paper_entry_price = self.child_ask
                 self.paper_usdt -= qty * self.paper_entry_price
                 self.paper_euri += qty
@@ -1221,6 +1348,25 @@ class LUCWindow(QMainWindow):
         self.session_labels["cycles/min"].setText(str(cycles_min))
         self.session_labels["last entry snapshot"].setText(str(self.last_entry_snapshot_id))
         self.session_labels["last exit snapshot"].setText(str(self.last_exit_snapshot_id))
+        cp = getattr(self, "current_sizing", {})
+        passive_rec = cp.get("passive", {}).get("size", 0.0)
+        trap_rec = max(cp.get("trap_buy", {}).get("size", 0.0), cp.get("trap_sell", {}).get("size", 0.0))
+        anchor1 = min(float(self.settings.get("budget_anchor", 0.0)) * 0.20, float(self.settings.get("sizing_max_order_size", 200.0)))
+        anchor2 = min(float(self.settings.get("budget_anchor", 0.0)) * 0.30, float(self.settings.get("sizing_max_order_size", 200.0)))
+        anchor3 = min(float(self.settings.get("budget_anchor", 0.0)) * 0.50, float(self.settings.get("sizing_max_order_size", 200.0)))
+        used_budget = 0.0 if float(self.settings.get("budget_total", 1.0)) <= 0 else min(100.0, (self.paper_trapped_euri * child_mid) / float(self.settings.get("budget_total", 1.0)) * 100.0)
+        inv_factor = cp.get("passive", {}).get("inventory_factor", 1.0)
+        rnd_factor = cp.get("passive", {}).get("random_factor", 1.0)
+        active_mode = self.paper_cycle_source if self.paper_cycle_source != "NONE" else "IDLE"
+        self.sizing_labels["recommended passive size"].setText(f"{passive_rec:.2f}")
+        self.sizing_labels["recommended trap size"].setText(f"{trap_rec:.2f}")
+        self.sizing_labels["recommended anchor layer 1"].setText(f"{anchor1:.2f}")
+        self.sizing_labels["recommended anchor layer 2"].setText(f"{anchor2:.2f}")
+        self.sizing_labels["recommended anchor layer 3"].setText(f"{anchor3:.2f}")
+        self.sizing_labels["budget used %"].setText(f"{used_budget:.1f}%")
+        self.sizing_labels["inventory factor"].setText(f"{inv_factor:.2f}")
+        self.sizing_labels["random factor"].setText(f"{rnd_factor:.2f}")
+        self.sizing_labels["active sizing mode"].setText(active_mode)
         for idx, key in enumerate(["event 1", "event 2", "event 3", "event 4", "event 5", "event 6", "event 7", "event 8"]):
             if idx < len(self.paper_ledger):
                 evt = self.paper_ledger[idx]

@@ -10,5 +10,19 @@
   "symbols": {
     "parent": "EURUSDT",
     "child": "EURIUSDT"
-  }
+  },
+  "budget_total": 2000.0,
+  "budget_passive": 800.0,
+  "budget_traps": 700.0,
+  "budget_anchor": 500.0,
+  "budget_max_one_side": 1000.0,
+  "sizing_min_order_size": 10.0,
+  "sizing_max_order_size": 200.0,
+  "sizing_randomize": true,
+  "sizing_random_factor_pct": 20.0,
+  "paper_order_size_euri": 50.0,
+  "paper_dangerous_skew_pct": 35.0,
+  "paper_critical_skew_pct": 55.0,
+  "paper_max_open_cycles": 1,
+  "paper_max_cycles_per_min": 8
 }
