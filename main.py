@@ -37,7 +37,7 @@ CONFIG_PATH = Path(__file__).resolve().parent / "config" / "settings.json"
 
 def default_settings() -> dict:
     return {
-        "version": "0.1.3",
+        "version": "0.1.4",
         "binance_api_key": "",
         "binance_api_secret": "",
         "use_testnet": False,
@@ -325,13 +325,32 @@ class FullConfigDialog(QDialog):
         return json.loads(self.editor.toPlainText())
 
 
+class AllDataDialog(QDialog):
+    def __init__(self, terminal: "LUCTerminal") -> None:
+        super().__init__(terminal)
+        self.terminal = terminal
+        self.setWindowTitle("ALL DATA — LIVE DASHBOARD")
+        self.resize(960, 760)
+        layout = QVBoxLayout(self)
+        self.view = QPlainTextEdit()
+        self.view.setReadOnly(True)
+        layout.addWidget(self.view)
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.refresh)
+        self.timer.start(700)
+        self.refresh()
+
+    def refresh(self) -> None:
+        self.view.setPlainText(self.terminal._build_all_data_text())
+
+
 class LUCTerminal(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.settings = self._load_settings()
         self.thread: QThread | None = None
         self.worker: ConnectWorker | None = None
-        self.setWindowTitle("LUC v0.1.3 — Market Data Core + Hidden Tools Menu")
+        self.setWindowTitle("LUC v0.1.4 — Auto Connect + Live Dashboard")
         self.resize(1520, 920)
         self.runtime = self._default_runtime()
         self.log_file = self._open_log_file()
@@ -339,11 +358,18 @@ class LUCTerminal(QMainWindow):
         self._init_ui()
         self.market_timer = QTimer(self)
         self.market_timer.timeout.connect(self._poll_euri)
+        self.balance_timer = QTimer(self)
+        self.balance_timer.timeout.connect(self._connect_api)
+        self.balance_timer.start(20000)
         self.eur_watchdog = QTimer(self)
         self.eur_watchdog.timeout.connect(self._update_market_status)
         self.eur_watchdog.start(1000)
-        self._append_log("[v0.1.3] GUI cockpit initialized")
+        self.started_at = time.time()
+        self.last_status = {"api": "DISCONNECTED", "eur": "IDLE", "euri": "IDLE"}
+        self.runtime.update({"euri_poll_count": 0, "euri_stale_count": 0, "eur_ticks": [], "active_orders_count": 0, "cycles": 0, "wins": 0, "losses": 0, "realized_pnl": 0.0, "unrealized_pnl": 0.0, "tick_capture": 0})
+        self._append_log("[v0.1.4] GUI cockpit initialized")
         self._append_log("[SAFETY] No market data yet. No trading actions.")
+        QTimer.singleShot(0, self._auto_start)
     def _default_runtime(self) -> dict:
         return {"eur": {}, "euri": {}, "fair_gap": None, "fair_gap_ticks": None, "trap_direction": "NONE", "passive_readiness": "BLOCKED", "source": {}}
 
@@ -362,7 +388,7 @@ class LUCTerminal(QMainWindow):
         return deep_merge(base, loaded)
 
     def _save_settings(self) -> None:
-        self.settings["version"] = "0.1.3"
+        self.settings["version"] = "0.1.4"
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
         with CONFIG_PATH.open("w", encoding="utf-8") as file:
             json.dump(self.settings, file, indent=2, ensure_ascii=False)
@@ -397,7 +423,7 @@ class LUCTerminal(QMainWindow):
         self.setCentralWidget(central)
 
         top = QHBoxLayout()
-        self.version_label = self._status_label("LUC VERSION: 0.1.3")
+        self.version_label = self._status_label("LUC VERSION: 0.1.4")
         self.api_status_label = self._status_label("API STATUS: DISCONNECTED")
         self.eur_status = self._status_label("EURUSDT STATUS: IDLE")
         self.euri_status = self._status_label("EURIUSDT STATUS: IDLE")
@@ -465,8 +491,6 @@ class LUCTerminal(QMainWindow):
 
     def _open_tools_menu(self) -> None:
         menu = QMenu(self)
-        menu.addAction("CONNECT", self._connect_api)
-        menu.addAction("REFRESH BALANCES", self._connect_api)
         menu.addAction("SETTINGS", self._open_settings)
         menu.addAction("FULL CONFIG", self._open_full_config)
         menu.addAction("ALL DATA", self._show_all_data)
@@ -477,6 +501,9 @@ class LUCTerminal(QMainWindow):
 
     def _set_api_status(self, status: str) -> None:
         self.api_status_label.setText(f"API STATUS: {status}")
+        if self.last_status.get("api") != status:
+            self._append_log(f"[STATUS] API -> {status}")
+            self.last_status["api"] = status
 
     def _apply_connect_result(self, payload: dict) -> None:
         balances = payload.get("balances", {})
@@ -487,6 +514,7 @@ class LUCTerminal(QMainWindow):
         f = payload.get("filters", {})
         self.filters_label.setText(f"tickSize={f.get('tickSize', 'N/A')} / stepSize={f.get('stepSize', 'N/A')} / minNotional={f.get('minNotional', 'N/A')}")
         self._start_market_data()
+        self._append_log("[ACCOUNT] balances refreshed")
 
     def _start_market_data(self):
         self._start_eur_ws()
@@ -503,12 +531,12 @@ class LUCTerminal(QMainWindow):
         self.ws.connected.connect(lambda: self._append_log("[WS] EURUSDT connected"))
         self.ws.disconnected.connect(self._on_ws_disconnected)
         self.ws.textMessageReceived.connect(self._on_ws_message)
-        self.ws.errorOccurred.connect(lambda _: self.eur_status.setText("EURUSDT STATUS: ERROR"))
+        self.ws.errorOccurred.connect(lambda _: self._set_market_status(self.eur_status, "EURUSDT STATUS: ERROR", "eur"))
         self.ws.open(QUrl("wss://stream.binance.com:9443/ws/eurusdt@bookTicker"))
 
     def _on_ws_disconnected(self):
         self._append_log("[WS] EURUSDT disconnected")
-        self.eur_status.setText("EURUSDT STATUS: STALE")
+        self._set_market_status(self.eur_status, "EURUSDT STATUS: STALE", "eur")
         QTimer.singleShot(2000, self._start_eur_ws)
 
     def _on_ws_message(self, message: str):
@@ -517,7 +545,8 @@ class LUCTerminal(QMainWindow):
         now = time.time()
         self.runtime["eur"] = {"bid": bid, "ask": ask, "mid": (bid + ask) / 2, "time": now, "source": "ws:bookTicker"}
         self.eur_mid.setText(f"{self.runtime['eur']['mid']:.6f}")
-        self.eur_status.setText("EURUSDT STATUS: LIVE")
+        self._set_market_status(self.eur_status, "EURUSDT STATUS: LIVE", "eur")
+        self.runtime["eur_ticks"] = [t for t in self.runtime["eur_ticks"] if now - t < 60] + [now]
         self._recompute()
 
     def _poll_euri(self):
@@ -528,15 +557,16 @@ class LUCTerminal(QMainWindow):
             now = time.time()
             first = not self.runtime["euri"]
             self.runtime["euri"] = {"bid": bid, "ask": ask, "mid": (bid + ask) / 2, "spread_ticks": self._ticks(ask - bid), "time": now, "source": "http:bookTicker"}
+            self.runtime["euri_poll_count"] += 1
             if first:
                 self._append_log("[HTTP] EURIUSDT first data")
             self.euri_bid.setText(f"{bid:.6f}")
             self.euri_ask.setText(f"{ask:.6f}")
             self.euri_spread.setText(str(self.runtime["euri"]["spread_ticks"]))
-            self.euri_status.setText("EURIUSDT STATUS: LIVE")
+            self._set_market_status(self.euri_status, "EURIUSDT STATUS: LIVE", "euri")
             self._recompute()
         except Exception as exc:  # noqa: BLE001
-            self.euri_status.setText("EURIUSDT STATUS: ERROR")
+            self._set_market_status(self.euri_status, "EURIUSDT STATUS: ERROR", "euri")
             self._append_log(f"[ERROR] EURI poll failed: {exc}")
 
     def _ticks(self, value: float) -> int:
@@ -563,29 +593,15 @@ class LUCTerminal(QMainWindow):
         for key, label, prefix in [("eur", self.eur_status, "EURUSDT STATUS: "), ("euri", self.euri_status, "EURIUSDT STATUS: ")]:
             data = self.runtime.get(key, {})
             if data and now - data.get("time", now) > max_age and "ERROR" not in label.text():
-                label.setText(prefix + "STALE")
+                self.runtime["euri_stale_count"] += 1 if key == "euri" else 0
+                self._set_market_status(label, prefix + "STALE", key)
 
     def _show_all_data(self):
-        payload = {
-            "eur_raw": self.runtime.get("eur", {}),
-            "euri_raw": self.runtime.get("euri", {}),
-            "fair_gap": self.runtime.get("fair_gap"),
-            "fair_gap_ticks": self.runtime.get("fair_gap_ticks"),
-            "settings_snapshot": self.settings,
-            "runtime_state": {"trap_direction": self.runtime.get("trap_direction"), "passive_readiness": self.runtime.get("passive_readiness")},
-            "balances": {"euri": self.euri_bal.text(), "usdt": self.usdt_bal.text()},
-            "filters": self.filters_label.text(),
-        }
-        dialog = QDialog(self)
-        dialog.setWindowTitle("ALL DATA")
-        dialog.resize(900, 700)
-        layout = QVBoxLayout(dialog)
-        view = QPlainTextEdit(json.dumps(payload, indent=2, ensure_ascii=False))
-        view.setReadOnly(True)
-        layout.addWidget(view)
-        dialog.exec()
+        AllDataDialog(self).exec()
 
     def _connect_api(self) -> None:
+        if self.thread and self.thread.isRunning():
+            return
         self.connect_btn.setEnabled(False)
         self.refresh_btn.setEnabled(False)
         self._set_api_status("CONNECTING")
@@ -602,6 +618,67 @@ class LUCTerminal(QMainWindow):
         self.thread.finished.connect(lambda: self.connect_btn.setEnabled(True))
         self.thread.finished.connect(lambda: self.refresh_btn.setEnabled(True))
         self.thread.start()
+
+    def _auto_start(self) -> None:
+        self._append_log("[AUTO] auto connect started")
+        self._connect_api()
+
+    def _set_market_status(self, label: QLabel, value: str, key: str) -> None:
+        if label.text() != value:
+            label.setText(value)
+            short = value.split(": ", 1)[-1]
+            if self.last_status.get(key) != short:
+                self._append_log(f"[STATUS] {key.upper()} -> {short}")
+                self.last_status[key] = short
+
+    def _build_all_data_text(self) -> str:
+        now = time.time()
+        eur = self.runtime.get("eur", {})
+        euri = self.runtime.get("euri", {})
+        tick = float(self.settings.get("general", {}).get("tick_size", 0.0001))
+        api_key = self.settings.get("binance_api_key", "")
+        masked = f"{api_key[:4]}...{api_key[-4:]}" if len(api_key) >= 8 else "***"
+        def age_ms(d): return int((now - d.get("time", now)) * 1000) if d else -1
+        eur_spread = (eur.get("ask", 0) - eur.get("bid", 0)) if eur else 0
+        euri_spread = (euri.get("ask", 0) - euri.get("bid", 0)) if euri else 0
+        euri_total = self._parse_total(self.euri_bal.text())
+        usdt_total = self._parse_total(self.usdt_bal.text())
+        total_est = usdt_total + euri_total * (euri.get("mid") or 0)
+        skew = (euri_total / (euri_total + usdt_total / max((euri.get("mid") or 1), 1e-9))) if (euri_total + usdt_total) > 0 else 0
+        return f"""EURUSDT Parent
+bid={eur.get('bid', 'N/A')} ask={eur.get('ask', 'N/A')} mid={eur.get('mid', 'N/A')} spread={eur_spread:.6f}
+source={eur.get('source', 'N/A')} update={eur.get('time', 0):.3f} age_ms={age_ms(eur)} status={self.eur_status.text()} ticks/min={len(self.runtime['eur_ticks'])}
+
+EURIUSDT Child
+bid={euri.get('bid', 'N/A')} ask={euri.get('ask', 'N/A')} mid={euri.get('mid', 'N/A')} spread={euri_spread:.6f} spread_ticks={self._ticks(euri_spread)}
+source={euri.get('source', 'N/A')} update={euri.get('time', 0):.3f} age_ms={age_ms(euri)} status={self.euri_status.text()} http_poll_count={self.runtime['euri_poll_count']} stale_count={self.runtime['euri_stale_count']}
+
+Fair Value / Edge
+fair_gap={self.runtime.get('fair_gap')} fair_gap_ticks={self.runtime.get('fair_gap_ticks')} trap_direction={self.runtime.get('trap_direction')}
+passive_readiness={self.runtime.get('passive_readiness')} corridor_state=N/A child_delay={age_ms(euri)} parent_impulse=N/A weak_side=N/A block_reason=N/A
+
+Balances
+EURI {self.euri_bal.text()}
+USDT {self.usdt_bal.text()}
+total_value_estimate={total_est:.6f} inventory_skew={skew:.4f} inventory_zone={self.inventory_zone.text()}
+
+Filters
+{self.filters_label.text()}
+
+Runtime
+app_version=0.1.4 uptime={int(now-self.started_at)}s current_mode={self.mode_label.text()} active_orders_count={self.runtime['active_orders_count']}
+cycles={self.runtime['cycles']} wins/losses={self.runtime['wins']}/{self.runtime['losses']} realized/unrealized_pnl={self.runtime['realized_pnl']}/{self.runtime['unrealized_pnl']} tick_capture={self.runtime['tick_capture']}
+
+Settings summary
+api_key={masked} api_secret=HIDDEN use_testnet={self.settings.get('use_testnet', False)} parent_symbol={self.settings.get('general',{}).get('parent_symbol')} base_symbol={self.settings.get('general',{}).get('base_symbol')} tick_size={tick}
+"""
+
+    @staticmethod
+    def _parse_total(text: str) -> float:
+        try:
+            return float(text.split("total=")[-1])
+        except Exception:
+            return 0.0
 
     def _open_settings(self) -> None:
         dialog = SettingsDialog(self.settings, self)
