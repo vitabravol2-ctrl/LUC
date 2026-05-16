@@ -7,6 +7,7 @@ import time
 import random
 import hmac
 import hashlib
+import math
 from urllib.parse import urlencode
 from collections import deque
 from enum import Enum
@@ -97,6 +98,7 @@ DEFAULT_SETTINGS = {
     "live_test_max_notional_usdt": 100.0,
     "live_test_price_offset_ticks": 1,
     "live_test_armed": False,
+    "live_test_cancel_after_sec": 15,
 }
 
 
@@ -348,6 +350,15 @@ class LUCWindow(QMainWindow):
         self.last_order_status = "-"
         self.test_orders: dict[str, dict[str, Any]] = {}
         self.test_order_events: deque[str] = deque(maxlen=5)
+        self.exchange_filters: dict[str, float] = {
+            "tick_size": float(self.settings.get("tick_size", 0.0001)),
+            "step_size": 0.0001,
+            "min_qty": 0.0,
+            "min_notional": 0.0,
+            "price_precision": 6.0,
+            "quantity_precision": 4.0,
+        }
+        self._last_sizing_ui_update_ts = 0.0
 
         self.parent_bid = 0.0
         self.parent_ask = 0.0
@@ -541,6 +552,9 @@ class LUCWindow(QMainWindow):
             "api status", "account status", "canTrade", "EURI free / locked", "USDT free / locked", "open test orders", "last API error", "last order status",
             "order 1", "order 2", "order 3", "order 4", "order 5",
             "event 1", "event 2", "event 3", "event 4", "event 5",
+        ])
+        self.exchange_labels = self.make_panel(grid, 4, 0, "EXCHANGE FILTERS", [
+            "tickSize", "stepSize", "minQty", "minNotional", "pricePrecision", "quantityPrecision",
         ])
         layout.addLayout(grid)
         self.log_box = QPlainTextEdit()
@@ -918,12 +932,41 @@ class LUCWindow(QMainWindow):
             self.api_usdt_locked = float(usdt.get("locked", 0.0))
             oo = self._binance_signed("GET", "/api/v3/openOrders", {"symbol": "EURIUSDT"})
             self.api_open_orders_count = len(oo)
+            self.load_exchange_filters()
         except Exception as exc:
             self.api_status = "ERROR"
             self.account_status = "ERROR"
             self.api_can_trade = False
             self.api_last_error = str(exc)
             self.log(f"[ERROR] api rejected {exc}")
+
+    def load_exchange_filters(self) -> None:
+        data = self._binance_signed("GET", "/api/v3/exchangeInfo", {"symbol": "EURIUSDT"})
+        symbols = data.get("symbols", [])
+        if not symbols:
+            return
+        symbol = symbols[0]
+        filters = {f.get("filterType"): f for f in symbol.get("filters", []) if isinstance(f, dict)}
+        price_filter = filters.get("PRICE_FILTER", {})
+        lot_filter = filters.get("LOT_SIZE", {})
+        notional_filter = filters.get("MIN_NOTIONAL", {}) or filters.get("NOTIONAL", {})
+        self.exchange_filters = {
+            "tick_size": float(price_filter.get("tickSize", self.exchange_filters.get("tick_size", 0.0001))),
+            "step_size": float(lot_filter.get("stepSize", self.exchange_filters.get("step_size", 0.0001))),
+            "min_qty": float(lot_filter.get("minQty", self.exchange_filters.get("min_qty", 0.0))),
+            "min_notional": float(notional_filter.get("minNotional", self.exchange_filters.get("min_notional", 0.0))),
+            "price_precision": float(symbol.get("pricePrecision", self.exchange_filters.get("price_precision", 6))),
+            "quantity_precision": float(symbol.get("quantityPrecision", self.exchange_filters.get("quantity_precision", 4))),
+        }
+        self.log("[API] exchangeInfo loaded")
+        self.log(f"[FILTER] tickSize={self.exchange_filters['tick_size']}")
+        self.log(f"[FILTER] stepSize={self.exchange_filters['step_size']}")
+        self.log(f"[FILTER] minNotional={self.exchange_filters['min_notional']}")
+
+    def _normalize_to_step(self, value: float, step: float) -> float:
+        if step <= 0:
+            return value
+        return math.floor(value / step) * step
 
     def test_api_connection(self) -> None:
         self.refresh_api_panel()
@@ -953,21 +996,44 @@ class LUCWindow(QMainWindow):
         qty = float(self.settings.get("live_test_order_size_euri", 1.0))
         max_notional = float(self.settings.get("live_test_max_notional_usdt", 100.0))
         offset_ticks = int(self.settings.get("live_test_price_offset_ticks", 1))
-        tick = float(self.settings.get("tick_size", 0.0001))
+        tick = float(self.exchange_filters.get("tick_size", self.settings.get("tick_size", 0.0001)))
+        step = float(self.exchange_filters.get("step_size", 0.0001))
+        min_qty = float(self.exchange_filters.get("min_qty", 0.0))
+        min_notional = float(self.exchange_filters.get("min_notional", 0.0))
+        qty_prec = int(self.exchange_filters.get("quantity_precision", 4))
+        price_prec = int(self.exchange_filters.get("price_precision", 6))
         for i in range(max_orders):
-            price = max(tick, self.child_bid - tick * (offset_ticks + i))
-            if qty * price > max_notional:
+            raw_price = max(tick, self.child_bid - tick * (offset_ticks + i))
+            price = self._normalize_to_step(raw_price, tick)
+            if price <= 0:
+                continue
+            norm_qty = max(min_qty, self._normalize_to_step(qty, step))
+            if norm_qty <= 0:
+                self.log("[ERROR] order below minQty")
                 break
-            if self.api_euri_balance < qty and self.api_usdt_balance < qty * price:
+            if min_notional > 0 and norm_qty * price < min_notional:
+                needed_qty = math.ceil((min_notional / price) / step) * step
+                if needed_qty > norm_qty:
+                    norm_qty = needed_qty
+            notional = norm_qty * price
+            self.log(f"[TEST] normalized qty={norm_qty:.8f}")
+            self.log(f"[TEST] normalized price={price:.8f}")
+            self.log(f"[TEST] final notional={notional:.8f}")
+            if min_notional > 0 and notional < min_notional:
+                self.log("[ERROR] order below minNotional")
+                break
+            if notional > max_notional:
+                break
+            if self.api_euri_balance < norm_qty and self.api_usdt_balance < notional:
                 self.log("[ERROR] insufficient balance.")
                 break
             cid = f"LUC_TEST_{int(time.time()*1000)}_{i}"
             try:
-                result = self._binance_signed("POST", "/api/v3/order", {"symbol": "EURIUSDT", "side": "BUY", "type": "LIMIT", "timeInForce": "GTC", "quantity": f"{qty:.4f}", "price": f"{price:.6f}", "newClientOrderId": cid})
+                result = self._binance_signed("POST", "/api/v3/order", {"symbol": "EURIUSDT", "side": "BUY", "type": "LIMIT", "timeInForce": "GTC", "quantity": f"{norm_qty:.{qty_prec}f}", "price": f"{price:.{price_prec}f}", "newClientOrderId": cid})
                 status = str(result.get("status", "NEW"))
-                self.test_orders[cid] = {"order_id": str(result.get("orderId", "-")), "side": "BUY", "qty": qty, "price": price, "status": status}
+                self.test_orders[cid] = {"order_id": str(result.get("orderId", "-")), "side": "BUY", "qty": norm_qty, "price": price, "status": status, "created_at": time.time()}
                 self.last_order_status = status
-                self.test_order_events.appendleft(f"{result.get('orderId','-')} BUY {qty:.4f} {price:.6f} {status}")
+                self.test_order_events.appendleft(f"{result.get('orderId','-')} BUY {norm_qty:.4f} {price:.6f} {status}")
                 self.log("[TEST] order sent")
             except Exception as exc:
                 self.log(f"[ERROR] api rejected {exc}")
@@ -996,6 +1062,14 @@ class LUCWindow(QMainWindow):
                     self.last_order_status = status
                     self.test_order_events.appendleft(f"{order.get('order_id','-')} {order.get('side','BUY')} {order.get('qty',0.0):.4f} {order.get('price',0.0):.6f} {status}")
                     self.log("[TEST] order status")
+                if status == "NEW":
+                    created_at = float(order.get("created_at", time.time()))
+                    cancel_after = float(self.settings.get("live_test_cancel_after_sec", 15))
+                    if time.time() - created_at >= cancel_after:
+                        self._binance_signed("DELETE", "/api/v3/order", {"symbol": "EURIUSDT", "origClientOrderId": cid})
+                        order["status"] = "CANCELED"
+                        self.last_order_status = "CANCELED"
+                        self.log("[TEST] stale order canceled")
             except Exception:
                 continue
 
@@ -1571,9 +1645,11 @@ class LUCWindow(QMainWindow):
         self._set_state_label("trap readiness", self.trap_readiness)
         self._set_regime_label("regime", self.current_regime.value, self.current_regime)
 
-        self._log_micro_change("eq", f"equilibrium={equilibrium_score} passive={passive_viability} class={market_class}")
+        if equilibrium_score // 5 != self._regime_confidence_bucket:
+            self._log_micro_change("eq", f"equilibrium={equilibrium_score} passive={passive_viability} class={market_class}")
         self._log_micro_change("refill", f"refill={refill_strength}")
-        self._log_micro_change("trap", f"trap_survivability={trap_survivability}")
+        if trap_survivability % 5 == 0:
+            self._log_micro_change("trap", f"trap_survivability={trap_survivability}")
         if market_class == "DANGEROUS_MARKET":
             self._log_micro_change("danger", "dangerous_market")
 
@@ -1645,13 +1721,21 @@ class LUCWindow(QMainWindow):
         inv_factor = cp.get("passive", {}).get("inventory_factor", 1.0)
         rnd_factor = cp.get("passive", {}).get("random_factor", 1.0)
         active_mode = self.paper_cycle_source if self.paper_cycle_source != "NONE" else "IDLE"
-        self.sizing_labels["passive size"].setText(f"{passive_rec:.2f}")
-        self.sizing_labels["trap size"].setText(f"{trap_rec:.2f}")
-        self.sizing_labels["anchor layer 1"].setText(f"{anchor1:.2f}")
-        self.sizing_labels["anchor layer 2"].setText(f"{anchor2:.2f}")
-        self.sizing_labels["anchor layer 3"].setText(f"{anchor3:.2f}")
-        self.sizing_labels["budget used %"].setText(f"{used_budget:.1f}%")
-        self.sizing_labels["random factor"].setText(f"{rnd_factor:.2f}")
+        if now_ts - self._last_sizing_ui_update_ts >= 5.0:
+            self.sizing_labels["passive size"].setText(f"{passive_rec:.2f}")
+            self.sizing_labels["trap size"].setText(f"{trap_rec:.2f}")
+            self.sizing_labels["anchor layer 1"].setText(f"{anchor1:.2f}")
+            self.sizing_labels["anchor layer 2"].setText(f"{anchor2:.2f}")
+            self.sizing_labels["anchor layer 3"].setText(f"{anchor3:.2f}")
+            self.sizing_labels["budget used %"].setText(f"{used_budget:.1f}%")
+            self.sizing_labels["random factor"].setText(f"{rnd_factor:.2f}")
+            self._last_sizing_ui_update_ts = now_ts
+        self.exchange_labels["tickSize"].setText(f"{self.exchange_filters.get('tick_size', 0.0):.8f}")
+        self.exchange_labels["stepSize"].setText(f"{self.exchange_filters.get('step_size', 0.0):.8f}")
+        self.exchange_labels["minQty"].setText(f"{self.exchange_filters.get('min_qty', 0.0):.8f}")
+        self.exchange_labels["minNotional"].setText(f"{self.exchange_filters.get('min_notional', 0.0):.8f}")
+        self.exchange_labels["pricePrecision"].setText(str(int(self.exchange_filters.get("price_precision", 6))))
+        self.exchange_labels["quantityPrecision"].setText(str(int(self.exchange_filters.get("quantity_precision", 4))))
         for idx, key in enumerate(["event 1", "event 2", "event 3", "event 4", "event 5"]):
             if idx < len(self.paper_ledger):
                 evt = self.paper_ledger[idx]
