@@ -1,5 +1,5 @@
 {
-  "version": "0.1.6",
+  "version": "0.1.7",
   "binance_api_key": "",
   "binance_api_secret": "",
   "use_testnet": false,
@@ -20,7 +20,11 @@
     "eur_stale_ms": 15000,
     "euri_stale_ms": 10000,
     "status_hysteresis_ms": 3000,
-    "tick_size": 0.0001
+    "tick_size": 0.0001,
+    "trading_enabled": false,
+    "require_order_confirmation": true,
+    "max_live_order_size": 100.0,
+    "allow_auto_orders": true
   },
   "passive": {
     "passive_enabled": true,
