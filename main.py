@@ -1004,11 +1004,19 @@ class LUCTerminal(QMainWindow):
         AllDataDialog(self).exec()
 
     def _connect_api(self) -> None:
-        if self.thread and isValid(self.thread) and self.thread.isRunning():
-            return
-        if self.thread and not isValid(self.thread):
-            self.thread = None
-        if self.worker and not isValid(self.worker):
+        thread = self.thread
+        if thread is not None:
+            if not isValid(thread):
+                self.thread = None
+            else:
+                try:
+                    if thread.isRunning():
+                        return
+                except RuntimeError:
+                    self.thread = None
+
+        worker = self.worker
+        if worker is not None and not isValid(worker):
             self.worker = None
         self.connect_btn.setEnabled(False)
         self.refresh_btn.setEnabled(False)
