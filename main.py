@@ -5,6 +5,7 @@ import sys
 import threading
 import time
 from collections import deque
+from enum import Enum
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -48,7 +49,27 @@ DEFAULT_SETTINGS = {
     "tick_size": 0.0001,
     "euri_poll_interval_sec": 4,
     "symbols": {"parent": "EURUSDT", "child": "EURIUSDT"},
+    "history_size": 50,
+    "corridor_window": 20,
+    "corridor_move_ticks": 3.0,
+    "corridor_center_tolerance_ticks": 1.5,
+    "corridor_churn_threshold": 0.35,
+    "parent_impulse_ticks": 6.0,
+    "stale_after_sec": 12,
 }
+
+
+class MarketState(str, Enum):
+    WAIT = "WAIT"
+    PASSIVE = "PASSIVE"
+    BUY_TRAP_READY = "BUY_TRAP_READY"
+    SELL_TRAP_READY = "SELL_TRAP_READY"
+    CORRIDOR_STABLE = "CORRIDOR_STABLE"
+    CORRIDOR_UNSTABLE = "CORRIDOR_UNSTABLE"
+    PARENT_IMPULSE = "PARENT_IMPULSE"
+    SPREAD_TOO_WIDE = "SPREAD_TOO_WIDE"
+    STALE_CHILD = "STALE_CHILD"
+
 
 
 class BasicSettingsDialog(QDialog):
@@ -181,6 +202,16 @@ class LUCWindow(QMainWindow):
         self.mode = "DRY_RUN" if self.settings.get("DRY_RUN", True) else "LIVE_DISABLED"
 
         self.log_buffer: deque[str] = deque(maxlen=500)
+        history_size = int(self.settings.get("history_size", 50))
+        self.parent_mid_hist: deque[float] = deque(maxlen=history_size)
+        self.child_mid_hist: deque[float] = deque(maxlen=history_size)
+        self.gap_ticks_hist: deque[float] = deque(maxlen=history_size)
+        self.last_child_update_ts = 0.0
+        self.current_state = MarketState.WAIT
+        self.corridor_state = MarketState.WAIT
+        self.parent_state = MarketState.WAIT
+        self.trap_readiness = MarketState.WAIT
+        self.stale_state = MarketState.WAIT
         self.stop_ws = threading.Event()
         self.ws_thread: threading.Thread | None = None
 
@@ -234,15 +265,20 @@ class LUCWindow(QMainWindow):
         grid = QGridLayout()
         self.market_labels = self.make_panel(grid, 0, 0, "Market", [
             "EUR bid", "EUR ask", "EUR mid", "EURI bid", "EURI ask", "EURI mid", "EURI spread",
+            "spread ticks", "EUR dir", "EURI dir", "parent vol ticks", "child stale sec",
         ])
         self.fair_labels = self.make_panel(grid, 0, 1, "Fair Value", [
             "EUR fair-value", "EURI mid", "fair gap", "fair gap ticks",
+            "corridor age", "corridor stability", "refill/churn",
         ])
         self.inventory_labels = self.make_panel(grid, 1, 0, "Inventory (demo)", [
             "EURI balance", "USDT balance", "total value", "inventory skew",
         ])
         self.session_labels = self.make_panel(grid, 1, 1, "Session (demo)", [
             "cycles", "wins", "losses", "pnl", "ticks harvested",
+        ])
+        self.state_labels = self.make_panel(grid, 2, 0, "Market State", [
+            "current state", "corridor state", "trap readiness", "parent state", "stale state",
         ])
         layout.addLayout(grid)
 
@@ -265,9 +301,9 @@ class LUCWindow(QMainWindow):
     def apply_theme(self) -> None:
         self.setStyleSheet("""
             QWidget { background-color: #0f1115; color: #d4d7de; font-family: Consolas, Menlo, monospace; font-size: 12px; }
-            QGroupBox { border: 1px solid #2b2f3a; margin-top: 8px; padding-top: 8px; }
+            QGroupBox { border: 1px solid #2b2f3a; margin-top: 6px; padding-top: 6px; }
             QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 4px; color: #8ab4f8; }
-            QPushButton { background: #1f2530; border: 1px solid #3a4252; padding: 4px 10px; }
+            QPushButton { background: #1f2530; border: 1px solid #3a4252; padding: 3px 8px; }
             QPushButton:hover { background: #263142; }
             QPlainTextEdit { border: 1px solid #2b2f3a; background: #0b0d12; }
         """)
@@ -356,17 +392,121 @@ class LUCWindow(QMainWindow):
             self.child_bid = float(payload.get("bidPrice", 0.0))
             self.child_ask = float(payload.get("askPrice", 0.0))
             self.http_status = "OK"
+            self.last_child_update_ts = time.time()
         except Exception as exc:
             self.http_status = "ERROR"
             self.log(f"HTTP error: {exc}")
+
+    def _direction(self, values: deque[float], tick_size: float) -> str:
+        if len(values) < 2 or not tick_size:
+            return "FLAT"
+        delta_ticks = (values[-1] - values[0]) / tick_size
+        if delta_ticks > 0.5:
+            return "UP"
+        if delta_ticks < -0.5:
+            return "DOWN"
+        return "FLAT"
+
+    def _state_color(self, state: MarketState) -> str:
+        if state in (MarketState.PASSIVE, MarketState.BUY_TRAP_READY):
+            return "#7CFC8A"
+        if state in (MarketState.SELL_TRAP_READY,):
+            return "#FF6E6E"
+        if state in (MarketState.CORRIDOR_STABLE,):
+            return "#6FA8FF"
+        if state in (MarketState.PARENT_IMPULSE, MarketState.STALE_CHILD):
+            return "#FFB366"
+        if state in (MarketState.SPREAD_TOO_WIDE,):
+            return "#FF6E6E"
+        return "#b7bdc8"
+
+    def _set_state_label(self, name: str, state: MarketState) -> None:
+        label = self.state_labels[name]
+        label.setText(state.value)
+        label.setStyleSheet(f"color: {self._state_color(state)}; font-weight: bold;")
+
+    def _log_state_change(self, state: MarketState) -> None:
+        if state != self.current_state:
+            self.log(f"[STATE] {state.value}")
+            self.current_state = state
 
     def refresh_view(self) -> None:
         parent_mid = (self.parent_bid + self.parent_ask) / 2 if self.parent_bid and self.parent_ask else 0.0
         child_mid = (self.child_bid + self.child_ask) / 2 if self.child_bid and self.child_ask else 0.0
         spread = self.child_ask - self.child_bid if self.child_bid and self.child_ask else 0.0
-        gap = parent_mid - child_mid
         tick_size = float(self.settings.get("tick_size", 0.0001))
+        spread_ticks = spread / tick_size if tick_size else 0.0
+        gap = parent_mid - child_mid
         gap_ticks = gap / tick_size if tick_size else 0.0
+
+        if parent_mid:
+            self.parent_mid_hist.append(parent_mid)
+        if child_mid:
+            self.child_mid_hist.append(child_mid)
+        self.gap_ticks_hist.append(gap_ticks)
+
+        corridor_window = int(self.settings.get("corridor_window", 20))
+        min_gap_ticks = float(self.settings.get("min_gap_ticks", 2))
+        max_spread_ticks = float(self.settings.get("max_spread_ticks", 3))
+        now_ts = time.time()
+        child_stale_sec = max(0.0, now_ts - self.last_child_update_ts) if self.last_child_update_ts else 9999.0
+
+        parent_dir = self._direction(self.parent_mid_hist, tick_size)
+        child_dir = self._direction(self.child_mid_hist, tick_size)
+        parent_vol_ticks = 0.0
+        if len(self.parent_mid_hist) >= 5 and tick_size:
+            recent_parent = list(self.parent_mid_hist)[-5:]
+            parent_vol_ticks = (max(recent_parent) - min(recent_parent)) / tick_size
+
+        recent_gap = list(self.gap_ticks_hist)[-corridor_window:]
+        corridor_age = len(recent_gap)
+        gap_center = sum(recent_gap) / len(recent_gap) if recent_gap else 0.0
+        gap_amplitude = (max(recent_gap) - min(recent_gap)) if recent_gap else 0.0
+        sign_changes = sum(1 for i in range(1, len(recent_gap)) if recent_gap[i - 1] * recent_gap[i] < 0)
+        churn = sign_changes / max(1, len(recent_gap) - 1)
+
+        stable_move = float(self.settings.get("corridor_move_ticks", 3.0))
+        stable_center = float(self.settings.get("corridor_center_tolerance_ticks", 1.5))
+        churn_threshold = float(self.settings.get("corridor_churn_threshold", 0.35))
+
+        corridor_stable = (
+            spread_ticks <= max_spread_ticks
+            and gap_amplitude <= stable_move
+            and abs(gap_center) <= stable_center
+            and churn <= churn_threshold
+            and corridor_age >= min(5, corridor_window)
+        )
+        self.corridor_state = MarketState.CORRIDOR_STABLE if corridor_stable else MarketState.CORRIDOR_UNSTABLE
+
+        self.stale_state = MarketState.WAIT
+        stale_after_sec = float(self.settings.get("stale_after_sec", 12))
+        if child_stale_sec >= stale_after_sec or spread <= 0.0:
+            self.stale_state = MarketState.STALE_CHILD
+
+        self.parent_state = MarketState.WAIT
+        if parent_vol_ticks >= float(self.settings.get("parent_impulse_ticks", 6.0)):
+            self.parent_state = MarketState.PARENT_IMPULSE
+
+        self.trap_readiness = MarketState.WAIT
+        if corridor_stable and spread_ticks <= max_spread_ticks:
+            if gap_ticks >= min_gap_ticks and parent_dir == "UP":
+                self.trap_readiness = MarketState.BUY_TRAP_READY
+            elif gap_ticks <= -min_gap_ticks and parent_dir == "DOWN":
+                self.trap_readiness = MarketState.SELL_TRAP_READY
+            elif abs(gap_ticks) < min_gap_ticks and spread_ticks <= 2:
+                self.trap_readiness = MarketState.PASSIVE
+
+        state = self.corridor_state if corridor_stable else MarketState.WAIT
+        if spread_ticks > max_spread_ticks:
+            state = MarketState.SPREAD_TOO_WIDE
+        if self.parent_state == MarketState.PARENT_IMPULSE:
+            state = MarketState.PARENT_IMPULSE
+        if self.stale_state == MarketState.STALE_CHILD:
+            state = MarketState.STALE_CHILD
+        if self.trap_readiness in (MarketState.BUY_TRAP_READY, MarketState.SELL_TRAP_READY, MarketState.PASSIVE):
+            state = self.trap_readiness
+
+        self._log_state_change(state)
 
         self.lbl_app.setText(f"APP STATUS: {self.app_status}")
         self.lbl_ws.setText(f"WS STATUS: {self.ws_status}")
@@ -380,11 +520,25 @@ class LUCWindow(QMainWindow):
         self.market_labels["EURI ask"].setText(f"{self.child_ask:.6f}")
         self.market_labels["EURI mid"].setText(f"{child_mid:.6f}")
         self.market_labels["EURI spread"].setText(f"{spread:.6f}")
+        self.market_labels["spread ticks"].setText(f"{spread_ticks:.2f}")
+        self.market_labels["EUR dir"].setText(parent_dir)
+        self.market_labels["EURI dir"].setText(child_dir)
+        self.market_labels["parent vol ticks"].setText(f"{parent_vol_ticks:.2f}")
+        self.market_labels["child stale sec"].setText(f"{child_stale_sec:.1f}")
 
         self.fair_labels["EUR fair-value"].setText(f"{parent_mid:.6f}")
         self.fair_labels["EURI mid"].setText(f"{child_mid:.6f}")
         self.fair_labels["fair gap"].setText(f"{gap:.6f}")
         self.fair_labels["fair gap ticks"].setText(f"{gap_ticks:.2f}")
+        self.fair_labels["corridor age"].setText(str(corridor_age))
+        self.fair_labels["corridor stability"].setText("stable" if corridor_stable else "unstable")
+        self.fair_labels["refill/churn"].setText(f"{churn:.2f}")
+
+        self._set_state_label("current state", state)
+        self._set_state_label("corridor state", self.corridor_state)
+        self._set_state_label("trap readiness", self.trap_readiness)
+        self._set_state_label("parent state", self.parent_state)
+        self._set_state_label("stale state", self.stale_state)
 
         self.inventory_labels["EURI balance"].setText("1000.00")
         self.inventory_labels["USDT balance"].setText("1000.00")
