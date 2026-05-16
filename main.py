@@ -383,6 +383,9 @@ class LUCWindow(QMainWindow):
         self.paper_cycle_snapshots = 0
         self.paper_last_close_ts = 0.0
         self.paper_fill_delay_left = 0
+        self.pending_paper_entry: dict[str, Any] | None = None
+        self._paper_step_last_snapshot_id = -1
+        self._sizing_random_by_snapshot: dict[int, float] = {}
         self.paper_overtrade_block_until = 0.0
         self.paper_fill_quality = 0
         self.paper_cycle_timestamps: deque[float] = deque(maxlen=120)
@@ -482,6 +485,8 @@ class LUCWindow(QMainWindow):
         grid.setRowStretch(4, 0)
 
     def start_paper_engine(self) -> None:
+        if self.paper_engine_enabled:
+            return
         self.paper_engine_enabled = True
         self.mode = "PAPER"
         self.paper_entry_block_reason = "waiting_new_snapshot"
@@ -512,6 +517,9 @@ class LUCWindow(QMainWindow):
         self.paper_trapped_euri = 0.0
         self.paper_entry_ts = 0.0
         self.paper_cycle_timestamps.clear()
+        self.pending_paper_entry = None
+        self.paper_fill_delay_left = 0
+        self._sizing_random_by_snapshot.clear()
         self.log("[CONTROL] paper engine RESET")
 
     def make_panel(self, grid: QGridLayout, row: int, col: int, title: str, fields: list[str]) -> dict[str, QLabel]:
@@ -909,7 +917,13 @@ class LUCWindow(QMainWindow):
         inventory_factor = self._calc_inventory_factor(skew, side, danger_skew, critical_skew)
         trap_factor = max(0.6, min(1.2, trap_survivability / 100.0 + 0.2)) if "TRAP" in mode else 1.0
         random_pct = float(self.settings.get("sizing_random_factor_pct", 20.0)) / 100.0
-        random_factor = random.uniform(1.0 - random_pct, 1.0 + random_pct) if self.settings.get("sizing_randomize", True) else 1.0
+        if self.settings.get("sizing_randomize", True):
+            random_factor = self._sizing_random_by_snapshot.get(self.euri_snapshot_id)
+            if random_factor is None:
+                random_factor = random.uniform(1.0 - random_pct, 1.0 + random_pct)
+                self._sizing_random_by_snapshot[self.euri_snapshot_id] = random_factor
+        else:
+            random_factor = 1.0
         size = base_size * regime_factor * gap_factor * mode_factor * inventory_factor * trap_factor * random_factor
         min_size = float(self.settings.get("sizing_min_order_size", 10.0))
         max_size = float(self.settings.get("sizing_max_order_size", 200.0))
@@ -940,14 +954,14 @@ class LUCWindow(QMainWindow):
             "anchor_layers": float(self.settings.get("budget_anchor", 0.0)),
         }.items():
             prev = self._last_sizing_logged.get(key)
-            if prev is None or (prev > 0 and abs(value - prev) / prev >= 0.12):
+            if prev is None or (prev > 0 and abs(value - prev) / prev >= 0.25):
                 if key == "anchor_layers":
                     a1 = min(value * 0.20, float(self.settings.get("sizing_max_order_size", 200.0)))
                     a2 = min(value * 0.30, float(self.settings.get("sizing_max_order_size", 200.0)))
                     a3 = min(value * 0.50, float(self.settings.get("sizing_max_order_size", 200.0)))
-                    self.log(f"[SIZING] anchor_layers={a1:.2f}/{a2:.2f}/{a3:.2f}")
+                    self._paper_log("sizing_anchor", f"[SIZING] anchor_layers={a1:.2f}/{a2:.2f}/{a3:.2f}", cooldown_sec=12.0)
                 else:
-                    self.log(f"[SIZING] {key}={value:.2f}")
+                    self._paper_log(f"sizing_{key}", f"[SIZING] {key}={value:.2f}", cooldown_sec=12.0)
                 self._last_sizing_logged[key] = value
         self.paper_cycle_mae = min(self.paper_cycle_mae, unrealized)
         self.paper_fill_quality = max(0, min(100, int(
@@ -1040,6 +1054,47 @@ class LUCWindow(QMainWindow):
         tick = float(self.settings.get("tick_size", 0.0001))
         min_passive = int(self.settings.get("paper_min_passive_viability", 65))
         min_trap = int(self.settings.get("paper_min_trap_survivability", 65))
+        is_new_snapshot = self.euri_snapshot_id > self._paper_step_last_snapshot_id
+        if is_new_snapshot:
+            self._paper_step_last_snapshot_id = self.euri_snapshot_id
+
+        if self.pending_paper_entry:
+            pending = self.pending_paper_entry
+            if is_new_snapshot:
+                pending["delay_left"] -= 1
+            self.paper_fill_delay_left = max(0, int(pending["delay_left"]))
+            if not (regime == Regime.IDEAL_PASSIVE and passive_viability >= min_passive and abs(skew) < danger_skew and spread_ticks <= max_spread_ticks):
+                self.paper_entry_block_reason = "pending_invalid:conditions"
+                self.log("[PAPER] pending entry dropped reason=conditions")
+                self.pending_paper_entry = None
+                return
+            if pending["delay_left"] > 0:
+                self.paper_entry_block_reason = "fill_delay"
+                return
+            qty = float(pending["qty"])
+            if self.paper_usdt < qty * self.child_bid:
+                self.paper_entry_block_reason = "pending_invalid:insufficient_usdt"
+                self.log("[PAPER] pending entry dropped reason=insufficient_usdt")
+                self.pending_paper_entry = None
+                return
+            self.paper_entry_price = self.child_bid
+            self.paper_usdt -= qty * self.paper_entry_price
+            self.paper_euri += qty
+            self.paper_pending_exit_price = self.child_ask
+            self.paper_entry_ts = now_ts
+            self.paper_trapped_euri = qty
+            self.paper_cycle_side = "LONG"
+            self.paper_state = PaperPositionState.PASSIVE_BUY
+            self.paper_cycle_state = CycleState.OPEN
+            self.paper_cycle_source = "PASSIVE"
+            self.last_entry_snapshot_id = self.euri_snapshot_id
+            self.paper_cycle_entry_snapshot_id = self.euri_snapshot_id
+            self.paper_cycle_snapshots = 1
+            if self._open_lot(side="BUY", qty=qty, price=self.paper_entry_price, now_ts=now_ts, source="PASSIVE"):
+                self.paper_entry_block_reason = "-"
+                self.log(f"[PAPER] open PASSIVE BUY qty={qty:.2f} price={self.paper_entry_price:.4f}")
+            self.pending_paper_entry = None
+            return
 
         if regime == Regime.IDEAL_PASSIVE and passive_viability >= min_passive and abs(skew) < danger_skew:
             if self.paper_usdt >= qty * self.child_bid and self._can_open_new_cycle():
@@ -1047,28 +1102,18 @@ class LUCWindow(QMainWindow):
                 if fill_delay < 0:
                     self.paper_entry_block_reason = "no_price_touch"
                     return
-                self.paper_fill_delay_left = fill_delay
-                if self.paper_fill_delay_left > 1:
-                    self.paper_fill_delay_left -= 1
-                    self.paper_entry_block_reason = "fill_delay"
-                    return
                 qty = sizing_passive["size"]
-                self.paper_entry_price = self.child_bid
-                self.paper_usdt -= qty * self.paper_entry_price
-                self.paper_euri += qty
-                self.paper_pending_exit_price = self.child_ask
-                self.paper_entry_ts = now_ts
-                self.paper_trapped_euri = qty
-                self.paper_cycle_side = "LONG"
-                self.paper_state = PaperPositionState.PASSIVE_BUY
-                self.paper_cycle_state = CycleState.OPEN
-                self.paper_cycle_source = "PASSIVE"
-                self.last_entry_snapshot_id = self.euri_snapshot_id
-                self.paper_cycle_entry_snapshot_id = self.euri_snapshot_id
-                self.paper_cycle_snapshots = 1
-                if self._open_lot(side="BUY", qty=qty, price=self.paper_entry_price, now_ts=now_ts, source="PASSIVE"):
-                    self.paper_entry_block_reason = "-"
-                    self.log(f"[PAPER] open PASSIVE BUY qty={qty:.2f} price={self.paper_entry_price:.4f}")
+                self.paper_fill_delay_left = fill_delay
+                self.pending_paper_entry = {
+                    "side": "BUY",
+                    "mode": "PASSIVE",
+                    "qty": qty,
+                    "entry_price": self.child_bid,
+                    "target_price": self.child_ask,
+                    "created_snapshot": self.euri_snapshot_id,
+                    "delay_left": fill_delay,
+                }
+                self.paper_entry_block_reason = "fill_delay"
         elif regime == Regime.IDEAL_TRAP and trap_survivability >= min_trap and gap_ticks >= min_gap_ticks and parent_dir == "UP":
             if self.paper_usdt >= qty * self.child_ask and self._can_open_new_cycle():
                 qty = sizing_trap_buy["size"]
