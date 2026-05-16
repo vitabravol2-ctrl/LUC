@@ -38,7 +38,7 @@ CONFIG_PATH = Path(__file__).resolve().parent / "config" / "settings.json"
 
 def default_settings() -> dict:
     return {
-        "version": "0.1.7",
+        "version": "0.1.8",
         "binance_api_key": "",
         "binance_api_secret": "",
         "use_testnet": False,
@@ -61,6 +61,10 @@ def default_settings() -> dict:
             "require_order_confirmation": True,
             "max_live_order_size": 100.0,
             "allow_auto_orders": True,
+            "execution_cooldown_sec": 2,
+            "max_order_lifetime_sec": 60,
+            "max_trade_log_rows_gui": 80,
+            "max_event_log_rows_gui": 500,
         },
         "passive": {
             "passive_enabled": True,
@@ -247,6 +251,12 @@ class SettingsDialog(QDialog):
                 ("general.default_order_size", "default_order_size"),
                 ("general.max_inventory_shift", "max_inventory_shift"),
                 ("general.max_hold_sec", "max_hold_sec"),
+                ("general.max_live_order_size", "max_live_order_size"),
+                ("general.allow_auto_orders", "allow_auto_orders"),
+                ("general.execution_cooldown_sec", "execution_cooldown_sec"),
+                ("general.max_order_lifetime_sec", "max_order_lifetime_sec"),
+                ("general.max_trade_log_rows_gui", "max_trade_log_rows_gui"),
+                ("general.max_event_log_rows_gui", "max_event_log_rows_gui"),
             ],
             "Passive Corridor": [
                 ("passive.passive_enabled", "passive_enabled"),
@@ -371,7 +381,7 @@ class LUCTerminal(QMainWindow):
         self.settings = self._load_settings()
         self.thread: QThread | None = None
         self.worker: ConnectWorker | None = None
-        self.setWindowTitle("LUC v0.1.7 — Auto Trading Gate + Confirmation")
+        self.setWindowTitle("LUC v0.1.8 — Full Auto Mode + Trade Log System")
         self.resize(1520, 920)
         self.runtime = self._default_runtime()
         self.log_file = self._open_log_file()
@@ -392,7 +402,7 @@ class LUCTerminal(QMainWindow):
         self._update_trading_button()
         self.last_status = {"api": "DISCONNECTED", "eur": "IDLE", "euri": "IDLE"}
         self.runtime.update({"euri_poll_count": 0, "euri_stale_count": 0, "eur_ticks": [], "active_orders_count": 0, "cycles": 0, "wins": 0, "losses": 0, "realized_pnl": 0.0, "unrealized_pnl": 0.0, "tick_capture": 0})
-        self._append_log("[v0.1.7] GUI cockpit initialized")
+        self._append_log("[v0.1.8] GUI cockpit initialized")
         self._append_log("[STABILITY] hysteresis enabled")
         self._append_log("[THEME] dark theme enabled")
         self._append_log("[SAFETY] No market data yet. No trading actions.")
@@ -429,8 +439,13 @@ class LUCTerminal(QMainWindow):
     def _open_log_file(self):
         logs_dir = CONFIG_PATH.parent / "logs"
         logs_dir.mkdir(parents=True, exist_ok=True)
-        p = logs_dir / f"session_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.log"
-        return p.open("a", encoding="utf-8")
+        return {"events": logs_dir / "events.log", "trades": logs_dir / "trades.log"}
+
+    def _rotate_log_if_needed(self, key: str) -> None:
+        path = self.log_file[key]
+        if path.exists() and path.stat().st_size > 5 * 1024 * 1024:
+            ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            path.rename(path.with_name(f"{key}_{ts}.log"))
 
     def _load_settings(self) -> dict:
         base = default_settings()
@@ -441,21 +456,37 @@ class LUCTerminal(QMainWindow):
         return deep_merge(base, loaded)
 
     def _save_settings(self) -> None:
-        self.settings["version"] = "0.1.7"
+        self.settings["version"] = "0.1.8"
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
         with CONFIG_PATH.open("w", encoding="utf-8") as file:
             json.dump(self.settings, file, indent=2, ensure_ascii=False)
 
     def _append_log(self, message: str) -> None:
-        max_rows = int(self.settings.get("ui", {}).get("latest_logs_rows", 220))
+        max_rows = int(self.settings.get("general", {}).get("max_event_log_rows_gui", 500))
         lines = self.logs_view.toPlainText().splitlines()
         lines.append(message)
         if len(lines) > max_rows:
             lines = lines[-max_rows:]
         self.logs_view.setPlainText("\n".join(lines))
         self.logs_view.verticalScrollBar().setValue(self.logs_view.verticalScrollBar().maximum())
-        self.log_file.write(message + "\n")
-        self.log_file.flush()
+        self._rotate_log_if_needed("events")
+        with self.log_file["events"].open("a", encoding="utf-8") as fh:
+            fh.write(message + "\n")
+            fh.flush()
+
+    def _append_trade_log(self, event: str, payload: str) -> None:
+        msg = f"[{event}] {payload}"
+        max_rows = int(self.settings.get("general", {}).get("max_trade_log_rows_gui", 80))
+        lines = self.trade_logs_view.toPlainText().splitlines()
+        lines.append(msg)
+        if len(lines) > max_rows:
+            lines = lines[-max_rows:]
+        self.trade_logs_view.setPlainText("\n".join(lines))
+        self.trade_logs_view.verticalScrollBar().setValue(self.trade_logs_view.verticalScrollBar().maximum())
+        self._rotate_log_if_needed("trades")
+        with self.log_file["trades"].open("a", encoding="utf-8") as fh:
+            fh.write(msg + "\n")
+            fh.flush()
 
     def _status_label(self, text: str) -> QLabel:
         label = QLabel(text)
@@ -477,7 +508,7 @@ class LUCTerminal(QMainWindow):
         self.setCentralWidget(central)
 
         top = QHBoxLayout()
-        self.version_label = self._status_label("LUC VERSION: 0.1.7")
+        self.version_label = self._status_label("LUC VERSION: 0.1.8")
         self.api_status_label = self._status_label("API STATUS: DISCONNECTED")
         self.eur_status = self._status_label("EURUSDT STATUS: IDLE")
         self.euri_status = self._status_label("EURIUSDT STATUS: IDLE")
@@ -529,13 +560,20 @@ class LUCTerminal(QMainWindow):
         lower.addWidget(orders, 0, 2)
         root.addLayout(lower)
 
-        logs_box = QGroupBox("Logs")
+        logs_box = QGroupBox("Event Log")
         logs_layout = QVBoxLayout(logs_box)
         self.logs_view = QPlainTextEdit()
         self.logs_view.setReadOnly(True)
         self.logs_view.setMaximumHeight(210)
         logs_layout.addWidget(self.logs_view)
         root.addWidget(logs_box)
+        trade_box = QGroupBox("Trade Log")
+        trade_layout = QVBoxLayout(trade_box)
+        self.trade_logs_view = QPlainTextEdit()
+        self.trade_logs_view.setReadOnly(True)
+        self.trade_logs_view.setMaximumHeight(120)
+        trade_layout.addWidget(self.trade_logs_view)
+        root.addWidget(trade_box)
 
         buttons = QHBoxLayout()
         self.trading_btn = QPushButton("START TRADING")
@@ -947,23 +985,12 @@ class LUCTerminal(QMainWindow):
             return None
         return {"mode": mode, "side": side, "symbol": "EURIUSDT", "price": price, "qty": qty, "notional": notional, "reason": reason, "target": target}
 
-    def _confirm_order(self, order: dict) -> bool:
-        d = self.runtime.get("decision", {})
-        text = (f"Подтвердить ордер?\n- Mode: {order['mode']}\n- Action: {order['side']}\n- Symbol: {order['symbol']}\n- Price: {order['price']:.6f}\n- Qty: {order['qty']:.6f}\n- Notional: {order['notional']:.6f}\n- Reason: {order['reason']}\n- Expected target: {order['target']}\n- Current fair gap ticks: {d.get('fair_gap_ticks')}\n- Spread ticks: {d.get('euri_spread_ticks')}\n- Inventory zone: {d.get('inventory_zone')}")
-        result = QMessageBox.question(self, "Order Confirmation", text, QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel, QMessageBox.StandardButton.Cancel)
-        if result != QMessageBox.StandardButton.Ok:
-            self._append_log("[ORDER] canceled by user confirmation.")
-            return False
-        self._append_log("[ORDER] confirmation accepted")
-        return True
-
     def _execute_auto_order(self) -> None:
         order = self._prepare_order()
         if not order:
             return
         self._append_log(f"[ORDER] proposed order: {order['side']} {order['qty']:.6f} {order['symbol']} @ {order['price']:.6f} ({order['reason']})")
-        if bool(self.settings.get("general", {}).get("require_order_confirmation", True)) and not self._confirm_order(order):
-            return
+        self._append_log("[EXECUTION] auto order approved")
         try:
             if not self.client:
                 return
@@ -972,6 +999,7 @@ class LUCTerminal(QMainWindow):
             else:
                 resp = self.client.place_limit_sell(order["symbol"], order["qty"], order["price"])
             self._append_log(f"[ORDER] order sent id={resp.get('orderId')}")
+            self._append_trade_log("ORDER_SENT", f"id={resp.get('orderId')} side={order['side']} qty={order['qty']:.6f} price={order['price']:.6f}")
             self._refresh_open_orders()
             self._connect_api()
         except Exception as exc:
@@ -989,14 +1017,19 @@ class LUCTerminal(QMainWindow):
             return
         try:
             orders = self.client.get_open_orders("EURIUSDT")
+            prev_count = int(self.runtime.get("active_orders_count", 0))
             self.runtime["active_orders_count"] = len(orders)
             now_ms = int(time.time() * 1000)
             lines = []
-            for o in orders[:1]:
+            for o in orders:
                 age = max(0, (now_ms - int(o.get("time", now_ms))) // 1000)
-                lines.append(f"{o.get('side')} | {o.get('price')} | {o.get('origQty')} | {o.get('status')} | {age}s | {o.get('clientOrderId','')} | {o.get('orderId')}")
+                status = o.get("status")
+                if status in {"FILLED", "CANCELED"} and age > 10:
+                    continue
+                lines.append(f"{o.get('side')} | {o.get('price')} | {o.get('origQty')} | {status} | {age}s | {o.get('clientOrderId','')} | {o.get('orderId')}")
             self.active_orders_view.setPlainText("\n".join(lines) if lines else "No active orders.")
-            self._append_log("[ORDER] open orders refreshed")
+            if prev_count != len(orders):
+                self._append_log(f"[ORDER] open orders count changed: {prev_count} -> {len(orders)}")
         except Exception as exc:
             self._append_log(f"[ORDER] open orders refresh error: {exc}")
 
@@ -1084,7 +1117,7 @@ Filters
 {self.filters_label.text()}
 
 Runtime
-app_version=0.1.7 uptime={int(now-self.started_at)}s current_mode={self.mode_label.text()} active_orders_count={self.runtime['active_orders_count']}
+app_version=0.1.8 uptime={int(now-self.started_at)}s current_mode={self.mode_label.text()} active_orders_count={self.runtime['active_orders_count']}
 cycles={self.runtime['cycles']} wins/losses={self.runtime['wins']}/{self.runtime['losses']} realized/unrealized_pnl={self.runtime['realized_pnl']}/{self.runtime['unrealized_pnl']} tick_capture={self.runtime['tick_capture']}
 
 Decision Engine
