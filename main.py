@@ -386,11 +386,17 @@ class LUCTerminal(QMainWindow):
         self.runtime = self._default_runtime()
         self.log_file = self._open_log_file()
         self.ws: QWebSocket | None = None
+        self.ws_connected_logged = False
+        self.ws_start_skip_logged = False
+        self.api_connect_in_progress = False
+        self.api_connected_once = False
+        self.market_data_started = False
+        self.eur_ws_started = False
         self._init_ui()
         self.market_timer = QTimer(self)
         self.market_timer.timeout.connect(self._poll_euri)
         self.balance_timer = QTimer(self)
-        self.balance_timer.timeout.connect(self._connect_api)
+        self.balance_timer.timeout.connect(self._refresh_balances_only)
         self.balance_timer.start(20000)
         self.eur_watchdog = QTimer(self)
         self.eur_watchdog.timeout.connect(self._update_market_status)
@@ -413,8 +419,6 @@ class LUCTerminal(QMainWindow):
             "euri": {},
             "fair_gap": None,
             "fair_gap_ticks": None,
-            "trap_direction": "NONE",
-            "passive_readiness": "IDLE",
             "source": {},
             "decision": {
                 "data_fresh": False,
@@ -591,8 +595,6 @@ class LUCTerminal(QMainWindow):
         self.menu_btn = QPushButton("MENU")
         self.menu_btn.setMinimumWidth(160)
         self.menu_btn.clicked.connect(self._open_tools_menu)
-        self.connect_btn = self.menu_btn
-        self.refresh_btn = self.menu_btn
         buttons.addWidget(self.menu_btn)
         root.addLayout(buttons)
         self._apply_theme()
@@ -642,9 +644,13 @@ class LUCTerminal(QMainWindow):
         self.runtime["filters"] = f
         self.filters_label.setText(f"tickSize={f.get('tickSize', 'N/A')} / stepSize={f.get('stepSize', 'N/A')} / minNotional={f.get('minNotional', 'N/A')}")
         self._start_market_data()
+        self.api_connected_once = True
         self._append_log("[ACCOUNT] balances refreshed")
 
     def _start_market_data(self):
+        if self.market_data_started:
+            return
+        self.market_data_started = True
         self._start_eur_ws()
         sec = float(self.settings.get("general", {}).get("euri_http_poll_sec", 4))
         self.market_timer.start(int(max(3.0, min(5.0, sec)) * 1000))
@@ -654,17 +660,33 @@ class LUCTerminal(QMainWindow):
     def _start_eur_ws(self):
         if not self.settings.get("general", {}).get("eur_ws_enabled", True):
             return
+        ws_alive = self.ws is not None and isValid(self.ws) and self.ws.state() == QWebSocket.SocketState.ConnectedState
+        if self.eur_ws_started or ws_alive:
+            if not self.ws_start_skip_logged:
+                self._append_log("[WS] start skipped: already started")
+                self.ws_start_skip_logged = True
+            return
+        self.eur_ws_started = True
+        self.ws_start_skip_logged = False
+        self.ws_connected_logged = False
         self.eur_status.setText("EURUSDT STATUS: WS CONNECTING")
         self.ws = QWebSocket()
-        self.ws.connected.connect(lambda: self._append_log("[WS] EURUSDT connected"))
+        self.ws.connected.connect(self._on_ws_connected)
         self.ws.disconnected.connect(self._on_ws_disconnected)
         self.ws.textMessageReceived.connect(self._on_ws_message)
         self.ws.errorOccurred.connect(lambda _: self._set_market_status(self.eur_status, "EURUSDT STATUS: ERROR", "eur"))
         self.ws.open(QUrl("wss://stream.binance.com:9443/ws/eurusdt@bookTicker"))
 
+    def _on_ws_connected(self):
+        if not self.ws_connected_logged:
+            self._append_log("[WS] EURUSDT connected")
+            self.ws_connected_logged = True
+
     def _on_ws_disconnected(self):
         self._append_log("[WS] EURUSDT disconnected")
         self._set_market_status(self.eur_status, "EURUSDT STATUS: STALE", "eur")
+        self.eur_ws_started = False
+        self.ws_connected_logged = False
         QTimer.singleShot(2000, self._start_eur_ws)
 
     def _on_ws_message(self, message: str):
@@ -815,18 +837,21 @@ class LUCTerminal(QMainWindow):
             planned_action = "PASSIVE_BUY_SELL"
 
         passive_score = 0
-        passive_score += 25 if data_fresh else 0
-        passive_score += 20 if spread_ticks is not None and spread_ticks <= int(passive.get("passive_max_spread_ticks", 3)) else 0
-        passive_score += 20 if fair_gap_ticks is not None and abs(fair_gap_ticks) < int(trap.get("trap_min_gap_ticks", 2)) else 0
-        passive_score += 20 if inventory_zone == "SAFE" else 0
-        passive_score += 15 if active_orders == 0 else 0
+        if bool(passive.get("passive_enabled", False)):
+            passive_score += 25 if data_fresh else 0
+            passive_score += 20 if spread_ticks is not None and spread_ticks <= int(passive.get("passive_max_spread_ticks", 3)) else 0
+            passive_score += 20 if fair_gap_ticks is not None and abs(fair_gap_ticks) < int(trap.get("trap_min_gap_ticks", 2)) else 0
+            passive_score += 20 if inventory_zone == "SAFE" else 0
+            passive_score += 15 if active_orders == 0 else 0
         trap_score = 0
-        trap_score += 20 if data_fresh else 0
-        trap_score += 20 if fair_gap_ticks is not None and abs(fair_gap_ticks) >= int(trap.get("trap_min_gap_ticks", 2)) else 0
-        trap_score += 15 if spread_ticks is not None and spread_ticks <= int(trap.get("trap_max_spread_ticks", 4)) else 0
-        trap_score += 15 if inventory_zone != "CRITICAL" else 0
-        trap_score += 15 if active_orders == 0 else 0
-        trap_score += 15 if trap_dir != "SELL_TRAP" or euri_total > float(trap.get("trap_order_size", 1.0)) else 0
+        trap_enabled = bool(trap.get("trap_enabled", False))
+        if trap_enabled:
+            trap_score += 20 if data_fresh else 0
+            trap_score += 20 if fair_gap_ticks is not None and abs(fair_gap_ticks) >= int(trap.get("trap_min_gap_ticks", 2)) else 0
+            trap_score += 15 if spread_ticks is not None and spread_ticks <= int(trap.get("trap_max_spread_ticks", 4)) else 0
+            trap_score += 15 if inventory_zone != "CRITICAL" else 0
+            trap_score += 15 if active_orders == 0 else 0
+            trap_score += 15 if trap_dir != "SELL_TRAP" or euri_total > float(trap.get("trap_order_size", 1.0)) else 0
         decision = self.runtime["decision"]
         decision.update({
             "data_fresh": data_fresh,
@@ -847,7 +872,7 @@ class LUCTerminal(QMainWindow):
             "passive_score": passive_score,
             "trap_score": trap_score,
             "passive_stability": self._score_to_stability(passive_score),
-            "trap_stability": self._score_to_stability(trap_score),
+            "trap_stability": "DISABLED" if not trap_enabled else self._score_to_stability(trap_score),
         })
         self._refresh_mode_cards()
         self._log_decision_changes()
@@ -1082,7 +1107,7 @@ class LUCTerminal(QMainWindow):
             self._append_log(f"[ORDER] order sent id={resp.get('orderId')}")
             self._append_trade_log("ORDER_SENT", f"id={resp.get('orderId')} side={order['side']} qty={order['qty']:.6f} price={order['price']:.6f}")
             self._refresh_open_orders()
-            self._connect_api()
+            self._refresh_balances_only()
         except Exception as exc:
             err = str(exc)
             self.runtime["last_order_error"] = err
@@ -1127,6 +1152,10 @@ class LUCTerminal(QMainWindow):
         AllDataDialog(self).exec()
 
     def _connect_api(self) -> None:
+        if self.api_connect_in_progress:
+            return
+        if self.api_connected_once:
+            return
         thread = self.thread
         if thread is not None:
             if not isValid(thread):
@@ -1141,8 +1170,7 @@ class LUCTerminal(QMainWindow):
         worker = self.worker
         if worker is not None and not isValid(worker):
             self.worker = None
-        self.connect_btn.setEnabled(False)
-        self.refresh_btn.setEnabled(False)
+        self.api_connect_in_progress = True
         self._set_api_status("CONNECTING")
         self.thread = QThread()
         self.worker = ConnectWorker(self.settings)
@@ -1156,11 +1184,25 @@ class LUCTerminal(QMainWindow):
         self.thread.finished.connect(self.thread.deleteLater)
         self.thread.finished.connect(lambda: setattr(self, "thread", None))
         self.thread.finished.connect(lambda: setattr(self, "worker", None))
-        self.thread.finished.connect(lambda: self.connect_btn.setEnabled(True))
-        self.thread.finished.connect(lambda: self.refresh_btn.setEnabled(True))
+        self.thread.finished.connect(lambda: setattr(self, "api_connect_in_progress", False))
         self.thread.start()
 
+    def _refresh_balances_only(self) -> None:
+        if not self.client:
+            return
+        try:
+            balances = self.client.get_account_balances(["EURI", "USDT"])
+            euri = balances.get("EURI", {"free": 0, "locked": 0, "total": 0})
+            usdt = balances.get("USDT", {"free": 0, "locked": 0, "total": 0})
+            self.euri_bal.setText(f"free={euri['free']:.8f} / locked={euri['locked']:.8f} / total={euri['total']:.8f}")
+            self.usdt_bal.setText(f"free={usdt['free']:.8f} / locked={usdt['locked']:.8f} / total={usdt['total']:.8f}")
+            self._append_log("[ACCOUNT] balances refreshed")
+        except Exception as exc:
+            self._append_log(f"[ACCOUNT] balances refresh error: {exc}")
+
     def _auto_start(self) -> None:
+        if self.api_connected_once or self.api_connect_in_progress:
+            return
         self._append_log("[AUTO] auto connect started")
         self._connect_api()
 
@@ -1195,8 +1237,8 @@ bid={euri.get('bid', 'N/A')} ask={euri.get('ask', 'N/A')} mid={euri.get('mid', '
 source={euri.get('source', 'N/A')} update={euri.get('time', 0):.3f} age_ms={age_ms(euri)} status={self.euri_status.text()} http_poll_count={self.runtime['euri_poll_count']} stale_count={self.runtime['euri_stale_count']}
 
 Fair Value / Edge
-fair_gap={self.runtime.get('fair_gap')} fair_gap_ticks={self.runtime.get('fair_gap_ticks')} trap_direction={self.runtime.get('trap_direction')}
-passive_readiness={self.runtime.get('passive_readiness')} corridor_state=N/A child_delay={age_ms(euri)} parent_impulse=N/A weak_side=N/A block_reason=N/A
+fair_gap={self.runtime.get('fair_gap')} fair_gap_ticks={self.runtime.get('fair_gap_ticks')} trap_direction={self.runtime['decision']['trap_direction']}
+passive_readiness={self.runtime['decision']['passive_status']} corridor_state=N/A child_delay={age_ms(euri)} parent_impulse=N/A weak_side=N/A block_reason={self.runtime['decision']['block_reason']}
 
 Balances
 EURI {self.euri_bal.text()}
