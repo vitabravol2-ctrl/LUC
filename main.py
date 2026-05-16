@@ -452,11 +452,11 @@ class LUCWindow(QMainWindow):
         layout = QVBoxLayout(root)
 
         top = QHBoxLayout()
-        self.toggle_btn = QPushButton("START")
+        self.toggle_btn = QPushButton("START TRADING")
         self.reset_btn = QPushButton("CANCEL LUC ORDERS")
         self.settings_btn = QPushButton("SETTINGS")
         self.full_json_btn = QPushButton("FULL JSON")
-        self.toggle_btn.clicked.connect(self.toggle_paper_engine)
+        self.toggle_btn.clicked.connect(self.toggle_live_trading)
         self.reset_btn.clicked.connect(self.cancel_live_orders)
         self.settings_btn.clicked.connect(self.open_basic_settings)
         self.full_json_btn.clicked.connect(self.open_json_settings)
@@ -487,17 +487,17 @@ class LUCWindow(QMainWindow):
         self.inventory_labels = self.make_panel(grid, 2, 0, "INVENTORY / PNL", [
             "EURI", "USDT", "total value", "realized pnl", "unrealized pnl", "skew", "open lots",
         ])
-        self.engine_labels = self.make_panel(grid, 0, 1, "PAPER ENGINE", [
-            "engine status", "paper state", "active cycle", "entry block reason", "fill quality", "cooldown", "min hold", "cycles/min",
+        self.engine_labels = self.make_panel(grid, 0, 1, "LIVE CYCLE", [
+            "engine status", "live state", "active cycle", "entry block reason", "fill quality", "cooldown", "min hold", "cycles/min",
         ])
         self.session_labels = self.make_panel(grid, 1, 1, "SESSION", [
             "cycles", "wins", "losses", "winrate", "avg pnl", "avg ticks", "avg hold",
         ])
-        self.sizing_labels = self.make_panel(grid, 2, 1, "SIZING", [
+        self.sizing_labels = self.make_panel(grid, 2, 1, "SESSION", [
             "passive size", "trap size", "anchor layer 1", "anchor layer 2", "anchor layer 3",
             "budget used %", "random factor",
         ])
-        self.ledger_labels = self.make_panel(grid, 3, 1, "LEDGER LAST EVENTS", [
+        self.ledger_labels = self.make_panel(grid, 3, 1, "LIVE EVENTS", [
             "event 1", "event 2", "event 3", "event 4", "event 5",
         ])
         self.api_labels = self.make_panel(grid, 3, 0, "SETTINGS/STATUS", [
@@ -519,19 +519,19 @@ class LUCWindow(QMainWindow):
         grid.setRowStretch(3, 2)
         grid.setRowStretch(4, 0)
 
-    def toggle_paper_engine(self) -> None:
+    def toggle_live_trading(self) -> None:
         if self.paper_engine_enabled:
             self.paper_engine_enabled = False
             self.mode = "STOPPED"
             self.paper_entry_block_reason = "STOPPED"
-            self.toggle_btn.setText("START")
-            self.log("[CONTROL] paper engine STOP (no new entries)")
+            self.toggle_btn.setText("START TRADING")
+            self.log("[CONTROL] live trading STOP")
             return
         self.paper_engine_enabled = True
-        self.mode = "PAPER"
+        self.mode = "LIVE"
         self.paper_entry_block_reason = "waiting_new_snapshot"
-        self.toggle_btn.setText("STOP")
-        self.log("[CONTROL] paper engine START")
+        self.toggle_btn.setText("STOP TRADING")
+        self.log("[CONTROL] live trading START")
 
     def cancel_live_orders(self) -> None:
         self.cancel_test_orders()
@@ -1456,19 +1456,7 @@ class LUCWindow(QMainWindow):
         self._regime_confidence = max(0, min(100, int(regime_score * 0.45 + metric_agreement * 0.30 + duration_bonus * 0.15 + regime_stability * 0.10)))
         self._update_regime(regime_candidate, regime_score, now_ts, regime_stability)
 
-        self._paper_step(
-            now_ts=now_ts,
-            child_mid=child_mid,
-            gap_ticks=gap_ticks,
-            spread_ticks=spread_ticks,
-            parent_dir=parent_dir,
-            regime=self.current_regime,
-            passive_viability=passive_viability,
-            trap_survivability=trap_survivability,
-            refill_strength=refill_strength,
-            churn_quality=churn_quality,
-            child_stale_sec=child_stale_sec,
-        )
+        # legacy paper runtime removed: no simulated step execution
 
         self._state_duration = self._state_duration + 1 if state == self.current_state else 1
         self.state_age_hist.append(self._state_duration)
@@ -1540,7 +1528,7 @@ class LUCWindow(QMainWindow):
         events = list(self.test_order_events)
         for i in range(5):
             self.api_labels[f"event {i+1}"].setText(events[i] if i < len(events) else "-")
-        self.engine_labels["paper state"].setText(self.paper_state.value)
+        self.engine_labels["live state"].setText(self.paper_state.value)
         self.engine_labels["active cycle"].setText(f"{self.paper_last_cycle} [{self.paper_cycle_source}]")
         self.session_labels["cycles"].setText(str(self.paper_cycles))
         self.session_labels["wins"].setText(str(self.paper_wins))
