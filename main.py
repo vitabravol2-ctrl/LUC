@@ -96,7 +96,15 @@ DEFAULT_SETTINGS = {
     "live_test_max_notional_usdt": 100.0,
     "live_test_price_offset_ticks": 1,
     "live_test_armed": False,
+    "trading_mode": "AUTO_SAFE",
+    "order_size_euri": 50.0,
+    "target_ticks": 1,
+    "buy_offset_ticks": 1,
+    "sell_offset_ticks": 1,
+    "order_timeout_sec": 20,
+    "live_armed": False,
 }
+
 
 
 
@@ -309,6 +317,9 @@ class LUCWindow(QMainWindow):
         self.api_usdt_balance = 0.0
         self.api_open_orders_count = 0
         self.last_order_status = "-"
+        self.filters_loaded = False
+        self.symbol_can_trade = False
+        self.symbol_filters: dict[str, float] = {}
         self.test_orders: dict[str, dict[str, Any]] = {}
         self.test_order_events: deque[str] = deque(maxlen=5)
 
@@ -442,26 +453,20 @@ class LUCWindow(QMainWindow):
 
         top = QHBoxLayout()
         self.toggle_btn = QPushButton("START")
-        self.reset_btn = QPushButton("RESET PAPER")
+        self.reset_btn = QPushButton("CANCEL LUC ORDERS")
         self.settings_btn = QPushButton("SETTINGS")
         self.full_json_btn = QPushButton("FULL JSON")
         self.toggle_btn.clicked.connect(self.toggle_paper_engine)
-        self.reset_btn.clicked.connect(self.reset_paper_engine)
+        self.reset_btn.clicked.connect(self.cancel_live_orders)
         self.settings_btn.clicked.connect(self.open_basic_settings)
         self.full_json_btn.clicked.connect(self.open_json_settings)
         for btn in (self.toggle_btn, self.reset_btn, self.settings_btn, self.full_json_btn):
             btn.setMinimumHeight(34)
             top.addWidget(btn)
-        self.arm_test_checkbox = QCheckBox("ARM TEST")
-        self.arm_test_checkbox.setChecked(bool(self.settings.get("live_test_armed", False)))
+        self.arm_test_checkbox = QCheckBox("LIVE ARMED")
+        self.arm_test_checkbox.setChecked(bool(self.settings.get("live_armed", False)))
         self.arm_test_checkbox.stateChanged.connect(self.on_arm_test_changed)
-        self.test_orders_btn = QPushButton("TEST 5 ORDERS")
-        self.test_orders_btn.clicked.connect(self.send_test_orders)
-        self.cancel_test_btn = QPushButton("CANCEL TEST ORDERS")
-        self.cancel_test_btn.clicked.connect(self.cancel_test_orders)
         top.addWidget(self.arm_test_checkbox)
-        top.addWidget(self.test_orders_btn)
-        top.addWidget(self.cancel_test_btn)
         self.lbl_app = QLabel()
         self.lbl_ws = QLabel()
         self.lbl_http = QLabel()
@@ -495,8 +500,8 @@ class LUCWindow(QMainWindow):
         self.ledger_labels = self.make_panel(grid, 3, 1, "LEDGER LAST EVENTS", [
             "event 1", "event 2", "event 3", "event 4", "event 5",
         ])
-        self.api_labels = self.make_panel(grid, 3, 0, "REAL API TEST", [
-            "api status", "account status", "EURI balance", "USDT balance", "open orders", "last order status",
+        self.api_labels = self.make_panel(grid, 3, 0, "SETTINGS/STATUS", [
+            "api status", "account status", "filters", "EURI balance", "USDT balance", "open orders", "last order status",
             "order 1", "order 2", "order 3", "order 4", "order 5",
             "event 1", "event 2", "event 3", "event 4", "event 5",
         ])
@@ -527,6 +532,9 @@ class LUCWindow(QMainWindow):
         self.paper_entry_block_reason = "waiting_new_snapshot"
         self.toggle_btn.setText("STOP")
         self.log("[CONTROL] paper engine START")
+
+    def cancel_live_orders(self) -> None:
+        self.cancel_test_orders()
 
     def reset_paper_engine(self) -> None:
         self.paper_state = PaperPositionState.FLAT
@@ -805,7 +813,7 @@ class LUCWindow(QMainWindow):
         return (env_key or cfg_key).strip(), (env_secret or cfg_secret).strip()
 
     def on_arm_test_changed(self) -> None:
-        self.settings["live_test_armed"] = self.arm_test_checkbox.isChecked()
+        self.settings["live_armed"] = self.arm_test_checkbox.isChecked()
         self.save_settings()
 
     def _binance_signed(self, method: str, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -831,6 +839,22 @@ class LUCWindow(QMainWindow):
             self.account_status = "NO_KEYS"
             return
         try:
+            info = requests.get("https://api.binance.com/api/v3/exchangeInfo", params={"symbol":"EURIUSDT"}, timeout=8).json()
+            syms = info.get("symbols", [])
+            if syms:
+                sym = syms[0]
+                self.symbol_can_trade = bool(sym.get("isSpotTradingAllowed", False)) and sym.get("status") == "TRADING"
+                filt = {f.get("filterType"): f for f in sym.get("filters", [])}
+                pf = filt.get("PRICE_FILTER", {})
+                lf = filt.get("LOT_SIZE", {})
+                nf = filt.get("NOTIONAL", filt.get("MIN_NOTIONAL", {}))
+                self.symbol_filters = {
+                    "tickSize": float(pf.get("tickSize", 0.0)),
+                    "stepSize": float(lf.get("stepSize", 0.0)),
+                    "minQty": float(lf.get("minQty", 0.0)),
+                    "minNotional": float(nf.get("minNotional", 0.0)),
+                }
+                self.filters_loaded = all(v > 0 for v in self.symbol_filters.values())
             acc = self._binance_signed("GET", "/api/v3/account")
             self.account_status = str(acc.get("accountType", "OK"))
             balances = {b.get("asset"): float(b.get("free", 0.0)) for b in acc.get("balances", [])}
@@ -839,13 +863,17 @@ class LUCWindow(QMainWindow):
             oo = self._binance_signed("GET", "/api/v3/openOrders", {"symbol": "EURIUSDT"})
             self.api_open_orders_count = len(oo)
         except Exception as exc:
+            self.filters_loaded = False
             self.api_status = "ERROR"
             self.account_status = "ERROR"
             self.log(f"[ERROR] api rejected {exc}")
 
     def send_test_orders(self) -> None:
         if not self.arm_test_checkbox.isChecked():
-            self.log("[TEST] ARM TEST is false")
+            self.log("[BLOCK] reason=live_armed=false")
+            return
+        if self.settings.get("DRY_RUN", True):
+            self.log("[BLOCK] reason=dry_run=true")
             return
         max_orders = min(5, int(self.settings.get("live_test_max_orders", 5)))
         qty = float(self.settings.get("live_test_order_size_euri", 1.0))
@@ -856,28 +884,28 @@ class LUCWindow(QMainWindow):
             price = max(tick, self.child_bid - tick * (offset_ticks + i))
             if qty * price > max_notional:
                 break
-            cid = f"LUC_TEST_{int(time.time()*1000)}_{i}"
+            cid = f"LUC_LIVE_PASSIVE_BUY_{int(time.time()*1000)}_{i}"
             try:
                 result = self._binance_signed("POST", "/api/v3/order", {"symbol": "EURIUSDT", "side": "BUY", "type": "LIMIT", "timeInForce": "GTC", "quantity": f"{qty:.4f}", "price": f"{price:.6f}", "newClientOrderId": cid})
                 status = str(result.get("status", "NEW"))
                 self.test_orders[cid] = {"order_id": str(result.get("orderId", "-")), "side": "BUY", "qty": qty, "price": price, "status": status}
                 self.last_order_status = status
                 self.test_order_events.appendleft(f"{result.get('orderId','-')} BUY {qty:.4f} {price:.6f} {status}")
-                self.log("[TEST] order sent")
+                self.log(f"[LIVE] mode=PASSIVE PLACE_BUY qty={qty:.4f} price={price:.6f}")
             except Exception as exc:
                 self.log(f"[ERROR] api rejected {exc}")
                 break
 
     def cancel_test_orders(self) -> None:
         for cid, order in list(self.test_orders.items()):
-            if not cid.startswith("LUC_TEST_"):
+            if not cid.startswith("LUC_LIVE_"):
                 continue
             try:
                 self._binance_signed("DELETE", "/api/v3/order", {"symbol": "EURIUSDT", "origClientOrderId": cid})
                 order["status"] = "CANCELED"
                 self.last_order_status = "CANCELED"
                 self.test_order_events.appendleft(f"{order.get('order_id','-')} {order.get('side','BUY')} {order.get('qty',0.0):.4f} {order.get('price',0.0):.6f} CANCELED")
-                self.log("[TEST] order canceled")
+                self.log("[LIVE] timeout cancel")
             except Exception as exc:
                 self.log(f"[ERROR] api rejected {exc}")
 
@@ -890,7 +918,7 @@ class LUCWindow(QMainWindow):
                     order["status"] = status
                     self.last_order_status = status
                     self.test_order_events.appendleft(f"{order.get('order_id','-')} {order.get('side','BUY')} {order.get('qty',0.0):.4f} {order.get('price',0.0):.6f} {status}")
-                    self.log("[TEST] order status")
+                    self.log(f"[LIVE] BUY status={status}")
             except Exception:
                 continue
 
@@ -1494,7 +1522,9 @@ class LUCWindow(QMainWindow):
 
         self.engine_labels["engine status"].setText("STARTED" if self.paper_engine_enabled else "STOPPED")
         self.api_labels["api status"].setText(self.api_status)
-        self.api_labels["account status"].setText(self.account_status)
+        can_trade = "YES" if self.symbol_can_trade else "NO"
+        self.api_labels["account status"].setText(f"{self.account_status} canTrade={can_trade}")
+        self.api_labels["filters"].setText("OK" if self.filters_loaded else "NOT LOADED")
         self.api_labels["EURI balance"].setText(f"{self.api_euri_balance:.4f}")
         self.api_labels["USDT balance"].setText(f"{self.api_usdt_balance:.4f}")
         self.api_labels["open orders"].setText(str(self.api_open_orders_count))
