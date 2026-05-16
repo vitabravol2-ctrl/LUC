@@ -671,20 +671,28 @@ class LUCWindow(QMainWindow):
             "inventory_after": self.paper_euri, "regime": self.current_regime.value, "paper_state": self.paper_state.value,
         })
 
-    def _open_lot(self, *, side: str, qty: float, price: float, now_ts: float, source: str) -> None:
-        if len(self.paper_lots) >= self.paper_max_open_cycles or self.paper_state != PaperPositionState.FLAT:
+    def _open_lot(self, *, side: str, qty: float, price: float, now_ts: float, source: str) -> bool:
+        if qty <= 1e-9:
+            self._warn_once("open_zero_qty", "[WARN] open_lot blocked: zero qty")
+            return False
+        if len(self.paper_lots) >= self.paper_max_open_cycles:
             self._warn_once("open_lot_blocked", "[WARN] open_lot blocked: active cycle or max_open_cycles reached")
-            return
+            return False
         self.paper_lots.append({"side": side, "qty": qty, "entry_price": price, "entry_time": now_ts, "source": source, "state": "OPEN"})
         self._ledger_add("OPEN_LOT", side, qty, price, 0.0, now_ts)
-        self._paper_log(f"ledger_open_{side}", f"[LEDGER] {side} lot opened qty={qty:.2f} @{price:.4f}", cooldown_sec=8.0)
+        self.log(f"[LEDGER] OPEN_LOT {side} qty={qty:.2f} price={price:.4f}")
+        return True
 
     def _can_open_new_cycle(self) -> bool:
         return self.paper_state == PaperPositionState.FLAT and len(self.paper_lots) < self.paper_max_open_cycles
 
-    def _close_lots(self, *, side: str, qty: float, price: float, now_ts: float, event_type: str) -> float:
+    def _close_lots(self, *, side: str, qty: float, price: float, now_ts: float, event_type: str) -> tuple[float, float]:
+        if qty <= 1e-9:
+            self._warn_once("zero_close_qty", "[WARN] zero close qty blocked")
+            return 0.0, 0.0
         remain = qty
         realized = 0.0
+        closed_qty = 0.0
         close_side = "SELL" if side == "BUY" else "BUY"
         for lot in list(self.paper_lots):
             if remain <= 1e-9 or lot["side"] != side or lot["qty"] <= 0:
@@ -694,11 +702,56 @@ class LUCWindow(QMainWindow):
             realized += pnl
             lot["qty"] -= chunk
             remain -= chunk
+            closed_qty += chunk
             lot["state"] = "CLOSED" if lot["qty"] <= 1e-9 else "PARTIAL"
         self.paper_lots = deque([x for x in self.paper_lots if x["qty"] > 1e-9])
         self.paper_realized_pnl += realized
-        self._ledger_add(event_type, close_side, qty - remain, price, realized, now_ts)
-        return realized
+        if closed_qty <= 1e-9:
+            self._warn_once("zero_close_qty", "[WARN] zero close qty blocked")
+            return 0.0, 0.0
+        self._ledger_add(event_type, close_side, closed_qty, price, realized, now_ts)
+        self.log(f"[LEDGER] {event_type} {close_side} qty={closed_qty:.2f} price={price:.4f} pnl={realized:+.4f}")
+        return realized, closed_qty
+
+    def _finalize_cycle_close(self, *, now_ts: float, close_price: float, side: str, source_state: PaperPositionState) -> None:
+        tracked_qty = self.paper_trapped_euri
+        pnl, closed_qty = self._close_lots(side=side, qty=tracked_qty, price=close_price, now_ts=now_ts, event_type="RECYCLE_CLOSE")
+        if closed_qty <= 1e-9:
+            return
+        tick = float(self.settings.get("tick_size", 0.0001))
+        source_name = self.paper_cycle_source
+        if side == "BUY":
+            self.paper_usdt += close_price * closed_qty
+            self.paper_euri -= closed_qty
+            ticks = (close_price - self.paper_entry_price) / tick if tick else 0.0
+            direction = "LONG"
+            close_side = "SELL"
+        else:
+            self.paper_usdt -= close_price * closed_qty
+            self.paper_euri += closed_qty
+            ticks = (self.paper_entry_price - close_price) / tick if tick else 0.0
+            direction = "SHORT"
+            close_side = "BUY"
+        self.paper_cycles += 1
+        self.paper_wins += 1 if pnl > 0 else 0
+        self.paper_losses += 1 if pnl < 0 else 0
+        self.paper_total_ticks += ticks
+        self.paper_total_hold_sec += max(0.0, now_ts - self.paper_entry_ts)
+        self.paper_avg_recycle_pnl = ((self.paper_avg_recycle_pnl * self.paper_recycle_count) + pnl) / max(1, self.paper_recycle_count + 1)
+        self.paper_recycle_count += 1
+        if source_state in {PaperPositionState.BUY_TRAP_ACTIVE, PaperPositionState.SELL_TRAP_ACTIVE}:
+            self.paper_trap_success += 1
+            self._paper_log("trap", "[PAPER] trap survived")
+        self.paper_last_cycle = f"{direction} {ticks:+.2f}t pnl={pnl:+.4f}"
+        self.paper_state = PaperPositionState.FLAT
+        self.paper_cycle_state = CycleState.CLOSED
+        self.paper_cycle_side = "NONE"
+        self.paper_cycle_source = "NONE"
+        self.paper_trapped_euri = 0.0
+        self.paper_entry_ts = 0.0
+        self.paper_cycle_partial = "NONE"
+        self.log(f"[PAPER] close {source_name} {close_side} qty={closed_qty:.2f} price={close_price:.4f} pnl={pnl:+.4f}")
+        self._paper_log("recycle", f"[PAPER] cycle closed pnl={pnl:+.4f} ticks={ticks:+.2f}")
 
     def _paper_step(self, *, now_ts: float, child_mid: float, gap_ticks: float, spread_ticks: float, parent_dir: str, regime: Regime, passive_viability: int, trap_survivability: int) -> None:
         if child_mid <= 0:
@@ -719,54 +772,12 @@ class LUCWindow(QMainWindow):
             self.paper_state = PaperPositionState.ESCAPE_UNLOAD
 
         if self.paper_state in {PaperPositionState.BUY_TRAP_ACTIVE, PaperPositionState.PASSIVE_BUY} and (self.child_ask >= self.paper_pending_exit_price > 0):
-            pnl = self._close_lots(side="BUY", qty=self.paper_trapped_euri, price=self.paper_pending_exit_price, now_ts=now_ts, event_type="RECYCLE_CLOSE")
-            ticks = (self.paper_pending_exit_price - self.paper_entry_price) / float(self.settings.get("tick_size", 0.0001))
-            self.paper_usdt += self.paper_pending_exit_price * self.paper_trapped_euri
-            self.paper_euri -= self.paper_trapped_euri
-            self.paper_realized_pnl += pnl
-            self.paper_cycles += 1
-            self.paper_wins += 1 if pnl >= 0 else 0
-            self.paper_losses += 1 if pnl < 0 else 0
-            self.paper_total_ticks += ticks
-            self.paper_total_hold_sec += max(0.0, now_ts - self.paper_entry_ts)
-            self.paper_avg_recycle_pnl = ((self.paper_avg_recycle_pnl * self.paper_recycle_count) + pnl) / max(1, self.paper_recycle_count + 1)
-            self.paper_recycle_count += 1
-            if self.paper_state == PaperPositionState.BUY_TRAP_ACTIVE:
-                self.paper_trap_success += 1
-                self._paper_log("trap", "[PAPER] trap survived")
-            self.paper_last_cycle = f"LONG {ticks:+.2f}t pnl={pnl:+.4f}"
-            self.paper_state = PaperPositionState.FLAT
-            self.paper_cycle_state = CycleState.CLOSED
-            self.paper_cycle_side = "NONE"
-            self.paper_cycle_source = "NONE"
-            self.paper_trapped_euri = 0.0
-            self._paper_log("recycle", f"[PAPER] recycle completed {ticks:+.2f} tick")
-            self._paper_log("close", f"[PAPER] cycle closed pnl={pnl:+.4f}")
+            source_state = self.paper_state
+            self._finalize_cycle_close(now_ts=now_ts, close_price=self.paper_pending_exit_price, side="BUY", source_state=source_state)
 
         if self.paper_state in {PaperPositionState.SELL_TRAP_ACTIVE, PaperPositionState.PASSIVE_SELL} and (self.child_bid <= self.paper_pending_exit_price < 10):
-            pnl = self._close_lots(side="SELL", qty=self.paper_trapped_euri, price=self.paper_pending_exit_price, now_ts=now_ts, event_type="RECYCLE_CLOSE")
-            ticks = (self.paper_entry_price - self.paper_pending_exit_price) / float(self.settings.get("tick_size", 0.0001))
-            self.paper_usdt -= self.paper_pending_exit_price * self.paper_trapped_euri
-            self.paper_euri += self.paper_trapped_euri
-            self.paper_realized_pnl += pnl
-            self.paper_cycles += 1
-            self.paper_wins += 1 if pnl >= 0 else 0
-            self.paper_losses += 1 if pnl < 0 else 0
-            self.paper_total_ticks += ticks
-            self.paper_total_hold_sec += max(0.0, now_ts - self.paper_entry_ts)
-            self.paper_avg_recycle_pnl = ((self.paper_avg_recycle_pnl * self.paper_recycle_count) + pnl) / max(1, self.paper_recycle_count + 1)
-            self.paper_recycle_count += 1
-            if self.paper_state == PaperPositionState.SELL_TRAP_ACTIVE:
-                self.paper_trap_success += 1
-                self._paper_log("trap", "[PAPER] trap survived")
-            self.paper_last_cycle = f"SHORT {ticks:+.2f}t pnl={pnl:+.4f}"
-            self.paper_state = PaperPositionState.FLAT
-            self.paper_cycle_state = CycleState.CLOSED
-            self.paper_cycle_side = "NONE"
-            self.paper_cycle_source = "NONE"
-            self.paper_trapped_euri = 0.0
-            self._paper_log("recycle", f"[PAPER] recycle completed {ticks:+.2f} tick")
-            self._paper_log("close", f"[PAPER] cycle closed pnl={pnl:+.4f}")
+            source_state = self.paper_state
+            self._finalize_cycle_close(now_ts=now_ts, close_price=self.paper_pending_exit_price, side="SELL", source_state=source_state)
 
         if self.paper_state in {PaperPositionState.BUY_TRAP_ACTIVE, PaperPositionState.SELL_TRAP_ACTIVE} and (abs(gap_ticks) < cancel_gap or now_ts - self.paper_entry_ts > max_hold_sec or regime in {Regime.DANGEROUS, Regime.ESCAPE}):
             self._paper_log("unload", "[PAPER] virtual unload")
@@ -793,6 +804,13 @@ class LUCWindow(QMainWindow):
                 self.paper_cycle_source = "NONE"
 
         if self.paper_state != PaperPositionState.FLAT:
+            if self.paper_cycle_state in {CycleState.OPEN, CycleState.ACTIVE, CycleState.WAIT_EXIT} and len(self.paper_lots) == 0:
+                self._warn_once("ghost_active_cycle", "[WARN] ghost active cycle repaired")
+                self.paper_state = PaperPositionState.FLAT
+                self.paper_cycle_state = CycleState.CLOSED
+                self.paper_cycle_side = "NONE"
+                self.paper_cycle_source = "NONE"
+                self.paper_trapped_euri = 0.0
             return
         if len(self.paper_lots) >= self.paper_max_open_cycles:
             self._warn_once("max_cycles", "[WARN] max_open_cycles reached")
@@ -818,7 +836,8 @@ class LUCWindow(QMainWindow):
                 self.paper_state = PaperPositionState.PASSIVE_BUY
                 self.paper_cycle_state = CycleState.OPEN
                 self.paper_cycle_source = "PASSIVE"
-                self._open_lot(side="BUY", qty=qty, price=self.paper_entry_price, now_ts=now_ts, source="PASSIVE")
+                if self._open_lot(side="BUY", qty=qty, price=self.paper_entry_price, now_ts=now_ts, source="PASSIVE"):
+                    self.log(f"[PAPER] open PASSIVE BUY qty={qty:.2f} price={self.paper_entry_price:.4f}")
         elif regime == Regime.IDEAL_TRAP and trap_survivability >= min_trap and gap_ticks >= min_gap_ticks and parent_dir == "UP":
             if self.paper_usdt >= qty * self.child_ask and self._can_open_new_cycle():
                 self.paper_entry_price = self.child_ask
