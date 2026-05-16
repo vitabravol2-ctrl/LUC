@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -295,6 +296,38 @@ class JsonSettingsDialog(QDialog):
         return json.loads(self.editor.toPlainText())
 
 
+def _mask_secret(value: str) -> str:
+    value = (value or "").strip()
+    if not value:
+        return ""
+    tail = value[-4:] if len(value) >= 4 else value
+    return "*" * max(8, len(value) - len(tail)) + tail
+
+
+class ApiSettingsDialog(QDialog):
+    def __init__(self, api_key: str, api_secret: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("BINANCE API SETTINGS")
+        self.resize(520, 220)
+        root = QVBoxLayout(self)
+        form = QFormLayout()
+        self.api_key_input = QLineEdit(api_key)
+        self.api_secret_input = QLineEdit(api_secret)
+        self.api_secret_input.setEchoMode(QLineEdit.Password)
+        form.addRow("API Key", self.api_key_input)
+        form.addRow("API Secret", self.api_secret_input)
+        root.addLayout(form)
+        buttons = QHBoxLayout()
+        self.save_btn = QPushButton("Save API Keys")
+        self.test_btn = QPushButton("Test Connection")
+        self.clear_btn = QPushButton("Clear API Keys")
+        self.close_btn = QPushButton("Close")
+        self.close_btn.clicked.connect(self.reject)
+        for btn in (self.save_btn, self.test_btn, self.clear_btn, self.close_btn):
+            buttons.addWidget(btn)
+        root.addLayout(buttons)
+
+
 class LUCWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -305,8 +338,12 @@ class LUCWindow(QMainWindow):
         self.api_key, self.api_secret = self.load_api_keys()
         self.api_status = "NO_KEYS" if not (self.api_key and self.api_secret) else "READY"
         self.account_status = "IDLE"
+        self.api_can_trade = False
+        self.api_last_error = "-"
         self.api_euri_balance = 0.0
+        self.api_euri_locked = 0.0
         self.api_usdt_balance = 0.0
+        self.api_usdt_locked = 0.0
         self.api_open_orders_count = 0
         self.last_order_status = "-"
         self.test_orders: dict[str, dict[str, Any]] = {}
@@ -445,11 +482,13 @@ class LUCWindow(QMainWindow):
         self.reset_btn = QPushButton("RESET PAPER")
         self.settings_btn = QPushButton("SETTINGS")
         self.full_json_btn = QPushButton("FULL JSON")
+        self.api_settings_btn = QPushButton("API SETTINGS")
         self.toggle_btn.clicked.connect(self.toggle_paper_engine)
         self.reset_btn.clicked.connect(self.reset_paper_engine)
         self.settings_btn.clicked.connect(self.open_basic_settings)
         self.full_json_btn.clicked.connect(self.open_json_settings)
-        for btn in (self.toggle_btn, self.reset_btn, self.settings_btn, self.full_json_btn):
+        self.api_settings_btn.clicked.connect(self.open_api_settings)
+        for btn in (self.toggle_btn, self.reset_btn, self.settings_btn, self.full_json_btn, self.api_settings_btn):
             btn.setMinimumHeight(34)
             top.addWidget(btn)
         self.arm_test_checkbox = QCheckBox("ARM TEST")
@@ -457,10 +496,13 @@ class LUCWindow(QMainWindow):
         self.arm_test_checkbox.stateChanged.connect(self.on_arm_test_changed)
         self.test_orders_btn = QPushButton("TEST 5 ORDERS")
         self.test_orders_btn.clicked.connect(self.send_test_orders)
+        self.refresh_balances_btn = QPushButton("REFRESH BALANCES")
+        self.refresh_balances_btn.clicked.connect(self.refresh_balances)
         self.cancel_test_btn = QPushButton("CANCEL TEST ORDERS")
         self.cancel_test_btn.clicked.connect(self.cancel_test_orders)
         top.addWidget(self.arm_test_checkbox)
         top.addWidget(self.test_orders_btn)
+        top.addWidget(self.refresh_balances_btn)
         top.addWidget(self.cancel_test_btn)
         self.lbl_app = QLabel()
         self.lbl_ws = QLabel()
@@ -496,7 +538,7 @@ class LUCWindow(QMainWindow):
             "event 1", "event 2", "event 3", "event 4", "event 5",
         ])
         self.api_labels = self.make_panel(grid, 3, 0, "REAL API TEST", [
-            "api status", "account status", "EURI balance", "USDT balance", "open orders", "last order status",
+            "api status", "account status", "canTrade", "EURI free / locked", "USDT free / locked", "open test orders", "last API error", "last order status",
             "order 1", "order 2", "order 3", "order 4", "order 5",
             "event 1", "event 2", "event 3", "event 4", "event 5",
         ])
@@ -800,9 +842,39 @@ class LUCWindow(QMainWindow):
     def load_api_keys(self) -> tuple[str, str]:
         env_key = os.getenv("BINANCE_API_KEY", "")
         env_secret = os.getenv("BINANCE_API_SECRET", "")
-        cfg_key = str(self.settings.get("api_key", ""))
-        cfg_secret = str(self.settings.get("api_secret", ""))
+        cfg_key = str(self.settings.get("binance_api_key", ""))
+        cfg_secret = str(self.settings.get("binance_api_secret", ""))
         return (env_key or cfg_key).strip(), (env_secret or cfg_secret).strip()
+
+    def open_api_settings(self) -> None:
+        dlg = ApiSettingsDialog(self.api_key, self.api_secret, self)
+        dlg.save_btn.clicked.connect(lambda: self._api_save_from_dialog(dlg))
+        dlg.test_btn.clicked.connect(self.test_api_connection)
+        dlg.clear_btn.clicked.connect(lambda: self._api_clear_from_dialog(dlg))
+        dlg.exec()
+
+    def _api_save_from_dialog(self, dlg: ApiSettingsDialog) -> None:
+        self.api_key = dlg.api_key_input.text().strip()
+        self.api_secret = dlg.api_secret_input.text().strip()
+        self.settings["binance_api_key"] = self.api_key
+        self.settings["binance_api_secret"] = self.api_secret
+        self.save_settings()
+        dlg.api_secret_input.setText(_mask_secret(self.api_secret))
+        self.log("[API] keys saved")
+        self.test_api_connection()
+
+    def _api_clear_from_dialog(self, dlg: ApiSettingsDialog) -> None:
+        self.api_key = ""
+        self.api_secret = ""
+        self.settings["binance_api_key"] = ""
+        self.settings["binance_api_secret"] = ""
+        self.save_settings()
+        dlg.api_key_input.setText("")
+        dlg.api_secret_input.setText("")
+        self.api_status = "NO_KEYS"
+        self.account_status = "NO_KEYS"
+        self.api_last_error = "No API keys"
+        self.log("[API] keys cleared")
 
     def on_arm_test_changed(self) -> None:
         self.settings["live_test_armed"] = self.arm_test_checkbox.isChecked()
@@ -829,23 +901,53 @@ class LUCWindow(QMainWindow):
         if not (self.api_key and self.api_secret):
             self.api_status = "NO_KEYS"
             self.account_status = "NO_KEYS"
+            self.api_can_trade = False
+            self.api_last_error = "No API keys"
             return
         try:
             acc = self._binance_signed("GET", "/api/v3/account")
-            self.account_status = str(acc.get("accountType", "OK"))
-            balances = {b.get("asset"): float(b.get("free", 0.0)) for b in acc.get("balances", [])}
-            self.api_euri_balance = balances.get("EURI", 0.0)
-            self.api_usdt_balance = balances.get("USDT", 0.0)
+            self.account_status = str(acc.get("accountType", "UNKNOWN"))
+            self.api_can_trade = bool(acc.get("canTrade", False))
+            self.api_last_error = "-"
+            balances = {b.get("asset"): b for b in acc.get("balances", [])}
+            euri = balances.get("EURI", {})
+            usdt = balances.get("USDT", {})
+            self.api_euri_balance = float(euri.get("free", 0.0))
+            self.api_euri_locked = float(euri.get("locked", 0.0))
+            self.api_usdt_balance = float(usdt.get("free", 0.0))
+            self.api_usdt_locked = float(usdt.get("locked", 0.0))
             oo = self._binance_signed("GET", "/api/v3/openOrders", {"symbol": "EURIUSDT"})
             self.api_open_orders_count = len(oo)
         except Exception as exc:
             self.api_status = "ERROR"
             self.account_status = "ERROR"
+            self.api_can_trade = False
+            self.api_last_error = str(exc)
             self.log(f"[ERROR] api rejected {exc}")
+
+    def test_api_connection(self) -> None:
+        self.refresh_api_panel()
+        if self.api_status == "CONNECTED":
+            self.log("[API] connected balances loaded")
+        elif self.api_status == "NO_KEYS":
+            self.log("[ERROR] api connection failed No API keys")
+        else:
+            self.log(f"[ERROR] api connection failed {self.api_last_error}")
+
+    def refresh_balances(self) -> None:
+        self.refresh_api_panel()
+        self.log("[API] balances refreshed")
 
     def send_test_orders(self) -> None:
         if not self.arm_test_checkbox.isChecked():
             self.log("[TEST] ARM TEST is false")
+            return
+        if not (self.api_key and self.api_secret):
+            self.log("[ERROR] api rejected No API keys.")
+            return
+        self.refresh_api_panel()
+        if not self.api_can_trade:
+            self.log("[ERROR] trading not allowed.")
             return
         max_orders = min(5, int(self.settings.get("live_test_max_orders", 5)))
         qty = float(self.settings.get("live_test_order_size_euri", 1.0))
@@ -855,6 +957,9 @@ class LUCWindow(QMainWindow):
         for i in range(max_orders):
             price = max(tick, self.child_bid - tick * (offset_ticks + i))
             if qty * price > max_notional:
+                break
+            if self.api_euri_balance < qty and self.api_usdt_balance < qty * price:
+                self.log("[ERROR] insufficient balance.")
                 break
             cid = f"LUC_TEST_{int(time.time()*1000)}_{i}"
             try:
@@ -1495,9 +1600,11 @@ class LUCWindow(QMainWindow):
         self.engine_labels["engine status"].setText("STARTED" if self.paper_engine_enabled else "STOPPED")
         self.api_labels["api status"].setText(self.api_status)
         self.api_labels["account status"].setText(self.account_status)
-        self.api_labels["EURI balance"].setText(f"{self.api_euri_balance:.4f}")
-        self.api_labels["USDT balance"].setText(f"{self.api_usdt_balance:.4f}")
-        self.api_labels["open orders"].setText(str(self.api_open_orders_count))
+        self.api_labels["canTrade"].setText("YES" if self.api_can_trade else "NO")
+        self.api_labels["EURI free / locked"].setText(f"{self.api_euri_balance:.4f} / {self.api_euri_locked:.4f}")
+        self.api_labels["USDT free / locked"].setText(f"{self.api_usdt_balance:.4f} / {self.api_usdt_locked:.4f}")
+        self.api_labels["open test orders"].setText(str(self.api_open_orders_count))
+        self.api_labels["last API error"].setText(self.api_last_error)
         self.api_labels["last order status"].setText(self.last_order_status)
         orders = list(self.test_orders.values())
         for i in range(5):
