@@ -38,7 +38,7 @@ CONFIG_PATH = Path(__file__).resolve().parent / "config" / "settings.json"
 
 def default_settings() -> dict:
     return {
-        "version": "0.1.11",
+        "version": "0.1.12",
         "binance_api_key": "",
         "binance_api_secret": "",
         "use_testnet": False,
@@ -381,7 +381,7 @@ class LUCTerminal(QMainWindow):
         self.settings = self._load_settings()
         self.thread: QThread | None = None
         self.worker: ConnectWorker | None = None
-        self.setWindowTitle("LUC v0.1.11 — Balance Refresh Fix + Smart Runtime Logging")
+        self.setWindowTitle("LUC v0.1.12 — Balance Refresh Fix + Smart Runtime Logging")
         self.resize(1520, 920)
         self.runtime = self._default_runtime()
         self.log_file = self._open_log_file()
@@ -408,7 +408,7 @@ class LUCTerminal(QMainWindow):
         self._update_trading_button()
         self.last_status = {"api": "DISCONNECTED", "eur": "IDLE", "euri": "IDLE"}
         self.runtime.update({"euri_poll_count": 0, "euri_stale_count": 0, "eur_ticks": [], "active_orders_count": 0, "cycles": 0, "wins": 0, "losses": 0, "realized_pnl": 0.0, "unrealized_pnl": 0.0, "tick_capture": 0})
-        self._append_log("[v0.1.11] GUI cockpit initialized")
+        self._append_log("[v0.1.12] GUI cockpit initialized")
         self._append_log("[STABILITY] hysteresis enabled")
         self._append_log("[THEME] dark theme enabled")
         self._append_log("[SAFETY] No market data yet. No trading actions.")
@@ -422,6 +422,9 @@ class LUCTerminal(QMainWindow):
             "source": {},
             "decision": {
                 "data_fresh": False,
+                "eur_fresh": False,
+                "euri_fresh": False,
+                "decision_freshness_source": "stale_ms",
                 "euri_spread_ticks": None,
                 "fair_gap_ticks": None,
                 "parent_impulse": "UNKNOWN",
@@ -474,7 +477,7 @@ class LUCTerminal(QMainWindow):
         return deep_merge(base, loaded)
 
     def _save_settings(self) -> None:
-        self.settings["version"] = "0.1.11"
+        self.settings["version"] = "0.1.12"
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
         with CONFIG_PATH.open("w", encoding="utf-8") as file:
             json.dump(self.settings, file, indent=2, ensure_ascii=False)
@@ -537,7 +540,7 @@ class LUCTerminal(QMainWindow):
         self.setCentralWidget(central)
 
         top = QHBoxLayout()
-        self.version_label = self._status_label("LUC VERSION: 0.1.11")
+        self.version_label = self._status_label("LUC VERSION: 0.1.12")
         self.api_status_label = self._status_label("API STATUS: DISCONNECTED")
         self.eur_status = self._status_label("EURUSDT STATUS: IDLE")
         self.euri_status = self._status_label("EURIUSDT STATUS: IDLE")
@@ -797,9 +800,18 @@ class LUCTerminal(QMainWindow):
         general = self.settings.get("general", {})
         passive = self.settings.get("passive", {})
         trap = self.settings.get("trap", {})
+        eur_stale_ms = int(general.get("eur_stale_ms", 15000))
+        euri_stale_ms = int(general.get("euri_stale_ms", 10000))
         max_age = float(general.get("max_data_age_sec", 8))
-        eur_fresh = bool(eur) and (now - eur.get("time", 0) <= max_age)
-        euri_fresh = bool(euri) and (now - euri.get("time", 0) <= max_age)
+        eur_age_ms = int((now - eur.get("time", now)) * 1000) if eur else 10**9
+        euri_age_ms = int((now - euri.get("time", now)) * 1000) if euri else 10**9
+        eur_fresh = bool(eur) and (eur_age_ms <= eur_stale_ms)
+        euri_fresh = bool(euri) and (euri_age_ms <= euri_stale_ms)
+        freshness_source = "stale_ms"
+        if not eur or not euri:
+            eur_fresh = bool(eur) and (now - eur.get("time", 0) <= max_age)
+            euri_fresh = bool(euri) and (now - euri.get("time", 0) <= max_age)
+            freshness_source = "legacy_max_data_age_sec"
         data_fresh = eur_fresh and euri_fresh
         spread_ticks = euri.get("spread_ticks")
         fair_gap_ticks = self.runtime.get("fair_gap_ticks")
@@ -886,6 +898,9 @@ class LUCTerminal(QMainWindow):
         decision = self.runtime["decision"]
         decision.update({
             "data_fresh": data_fresh,
+            "eur_fresh": eur_fresh,
+            "euri_fresh": euri_fresh,
+            "decision_freshness_source": freshness_source,
             "euri_spread_ticks": spread_ticks,
             "fair_gap_ticks": fair_gap_ticks,
             "parent_impulse": parent_impulse,
@@ -983,10 +998,14 @@ class LUCTerminal(QMainWindow):
         if last["inventory_zone"] != d["inventory_zone"]:
             self._append_log(f"[INVENTORY] zone changed: {last['inventory_zone']} -> {d['inventory_zone']}")
             last["inventory_zone"] = d["inventory_zone"]
-        self._log_once_or_changed("decision_passive_block_reason", f"[DECISION] passive block reason: {d['passive_block_reason']}", 10)
-        self._log_once_or_changed("decision_trap_block_reason", f"[DECISION] trap block reason: {d['trap_block_reason']}", 10)
+        self._log_once_or_changed("decision_passive_block_reason", f"[DECISION] passive block reason: {d['passive_block_reason']}", 30)
+        trap_enabled = bool(self.settings.get("trap", {}).get("trap_enabled", False))
+        if not trap_enabled:
+            self._log_once_or_changed("decision_trap_disabled", "[DECISION] trap block reason: DISABLED", 3600)
+        elif d["trap_block_reason"] != "DISABLED":
+            self._log_once_or_changed("decision_trap_block_reason", f"[DECISION] trap block reason: {d['trap_block_reason']}", 30)
         score_band = d.get("trap_stability", "DISABLED") if d.get("current_mode") == "AGGRESSIVE_TRAP" else d.get("passive_stability", "LOW")
-        self._log_once_or_changed("decision_score_band", f"[DECISION] score band: {score_band}", 10)
+        self._log_once_or_changed("decision_score_band", f"[DECISION] score band: {score_band}", 30)
 
     def _update_market_status(self):
         general = self.settings.get("general", {})
@@ -1127,13 +1146,14 @@ class LUCTerminal(QMainWindow):
     def _execute_auto_order(self) -> None:
         now = time.time()
         if now < float(self.runtime.get("execution_cooldown_until", 0.0)):
-            self._log_once_or_changed("execution_blocked_reason", "[EXECUTION] blocked reason: LAST_ERROR_COOLDOWN", 10)
+            self._log_once_or_changed("execution_blocked_reason", "[EXECUTION] blocked reason: LAST_ERROR_COOLDOWN", 30)
             return
         order = self._prepare_order()
         if not order:
             reason = self.runtime.get("last_execution_block_reason", "UNKNOWN")
             if reason and reason != "NONE":
-                self._log_once_or_changed("execution_blocked_reason", f"[EXECUTION] blocked reason: {reason}", 10)
+                interval = 3600 if reason == "TRADING_DISABLED" else 30
+                self._log_once_or_changed("execution_blocked_reason", f"[EXECUTION] blocked reason: {reason}", interval)
             return
         dedup_key = f"{order['side']}|{order['price']:.8f}|{order['qty']:.8f}|{order['reason']}"
         failed_keys = self.runtime.setdefault("failed_order_keys", {})
@@ -1311,7 +1331,7 @@ Filters
 {self.filters_label.text()}
 
 Runtime
-app_version=0.1.11 uptime={int(now-self.started_at)}s current_mode={self.mode_label.text()} active_orders_count={self.runtime['active_orders_count']}
+app_version=0.1.12 uptime={int(now-self.started_at)}s current_mode={self.mode_label.text()} active_orders_count={self.runtime['active_orders_count']}
 cycles={self.runtime['cycles']} wins/losses={self.runtime['wins']}/{self.runtime['losses']} realized/unrealized_pnl={self.runtime['realized_pnl']}/{self.runtime['unrealized_pnl']} tick_capture={self.runtime['tick_capture']}
 last_order_error={self.runtime.get('last_order_error')}
 execution_cooldown_until={self.runtime.get('execution_cooldown_until')}
@@ -1336,6 +1356,7 @@ planned_action={self.runtime['decision']['planned_action']}
 last_decision_time={self.runtime['decision']['last_decision_time']}
 eur_age_ms={age_ms(eur)} euri_age_ms={age_ms(euri)}
 eur_stale_ms={self.settings.get('general',{}).get('eur_stale_ms')} euri_stale_ms={self.settings.get('general',{}).get('euri_stale_ms')}
+eur_fresh={self.runtime['decision'].get('eur_fresh')} euri_fresh={self.runtime['decision'].get('euri_fresh')} decision_freshness_source={self.runtime['decision'].get('decision_freshness_source')}
 passive_score={self.runtime['decision'].get('passive_score')}
 trap_score={self.runtime['decision'].get('trap_score')}
 passive_stability={self.runtime['decision'].get('passive_stability')}
