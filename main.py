@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from shiboken6 import isValid
 
 CONFIG_PATH = Path(__file__).resolve().parent / "config" / "settings.json"
 
@@ -1003,8 +1004,12 @@ class LUCTerminal(QMainWindow):
         AllDataDialog(self).exec()
 
     def _connect_api(self) -> None:
-        if self.thread and self.thread.isRunning():
+        if self.thread and isValid(self.thread) and self.thread.isRunning():
             return
+        if self.thread and not isValid(self.thread):
+            self.thread = None
+        if self.worker and not isValid(self.worker):
+            self.worker = None
         self.connect_btn.setEnabled(False)
         self.refresh_btn.setEnabled(False)
         self._set_api_status("CONNECTING")
@@ -1018,6 +1023,8 @@ class LUCTerminal(QMainWindow):
         self.worker.done.connect(self.thread.quit)
         self.worker.done.connect(self.worker.deleteLater)
         self.thread.finished.connect(self.thread.deleteLater)
+        self.thread.finished.connect(lambda: setattr(self, "thread", None))
+        self.thread.finished.connect(lambda: setattr(self, "worker", None))
         self.thread.finished.connect(lambda: self.connect_btn.setEnabled(True))
         self.thread.finished.connect(lambda: self.refresh_btn.setEnabled(True))
         self.thread.start()
