@@ -322,6 +322,31 @@ class LUCWindow(QMainWindow):
         self.symbol_filters: dict[str, float] = {}
         self.test_orders: dict[str, dict[str, Any]] = {}
         self.test_order_events: deque[str] = deque(maxlen=5)
+        self.trading_enabled = False
+        self.live_state = "IDLE"
+        self.live_mode = "WAIT"
+        self.live_client_buy_id = ""
+        self.live_client_sell_id = ""
+        self.live_order_id = ""
+        self.live_side = "-"
+        self.live_qty = 0.0
+        self.live_entry_price = 0.0
+        self.live_exit_price = 0.0
+        self.live_buy_started_ts = 0.0
+        self.live_sell_started_ts = 0.0
+        self.live_buy_filled_qty = 0.0
+        self.live_buy_quote = 0.0
+        self.live_buy_avg_price = 0.0
+        self.live_sell_filled_qty = 0.0
+        self.live_sell_quote = 0.0
+        self.live_sell_avg_price = 0.0
+        self.live_realized_pnl = 0.0
+        self.live_cycles = 0
+        self.live_wins = 0
+        self.live_losses = 0
+        self.live_last_closed_cycle = "-"
+        self.live_block_reason = "STOPPED"
+        self.live_events: deque[str] = deque(maxlen=5)
 
         self.parent_bid = 0.0
         self.parent_ask = 0.0
@@ -520,21 +545,32 @@ class LUCWindow(QMainWindow):
         grid.setRowStretch(4, 0)
 
     def toggle_live_trading(self) -> None:
-        if self.paper_engine_enabled:
-            self.paper_engine_enabled = False
+        if self.trading_enabled:
+            self.trading_enabled = False
             self.mode = "STOPPED"
-            self.paper_entry_block_reason = "STOPPED"
+            self.live_block_reason = "STOPPED"
             self.toggle_btn.setText("START TRADING")
             self.log("[CONTROL] live trading STOP")
             return
-        self.paper_engine_enabled = True
+        self.trading_enabled = True
         self.mode = "LIVE"
-        self.paper_entry_block_reason = "waiting_new_snapshot"
+        self.live_state = "IDLE"
+        self.live_block_reason = "-"
         self.toggle_btn.setText("STOP TRADING")
         self.log("[CONTROL] live trading START")
 
     def cancel_live_orders(self) -> None:
-        self.cancel_test_orders()
+        try:
+            oo = self._binance_signed("GET", "/api/v3/openOrders", {"symbol": "EURIUSDT"})
+            for order in oo:
+                cid = str(order.get("clientOrderId", ""))
+                if not cid.startswith("LUC_LIVE_"):
+                    continue
+                self._binance_signed("DELETE", "/api/v3/order", {"symbol": "EURIUSDT", "origClientOrderId": cid})
+                self.live_events.appendleft(f"CANCELED {cid}")
+            self.last_order_status = "CANCELED"
+        except Exception as exc:
+            self.log(f"[ERROR] api rejected {exc}")
 
     def reset_paper_engine(self) -> None:
         self.paper_state = PaperPositionState.FLAT
@@ -922,13 +958,87 @@ class LUCWindow(QMainWindow):
             except Exception:
                 continue
 
+    def _norm_floor(self, value: float, step: float) -> float:
+        return (value // step) * step if step > 0 else value
+
+    def _norm_ceil(self, value: float, step: float) -> float:
+        if step <= 0:
+            return value
+        return ((value + step - 1e-12) // step) * step
+
+    def _place_live_limit(self, side: str, qty: float, price: float, client_id: str) -> dict[str, Any]:
+        return self._binance_signed("POST", "/api/v3/order", {
+            "symbol": "EURIUSDT", "side": side, "type": "LIMIT", "timeInForce": "GTC",
+            "quantity": f"{qty:.6f}", "price": f"{price:.6f}", "newClientOrderId": client_id,
+        })
+
+    def run_live_cycle(self, *, gap_ticks: float, spread_ticks: float, tick_size: float) -> None:
+        if not self.trading_enabled:
+            return
+        mode_cfg = str(self.settings.get("trading_mode", "AUTO_SAFE")).upper()
+        trap_ok = gap_ticks >= float(self.settings.get("min_gap_ticks", 2)) and spread_ticks <= float(self.settings.get("max_spread_ticks", 3)) and self.current_regime in {Regime.IDEAL_TRAP, Regime.IDEAL_PASSIVE} and self.trap_readiness == MarketState.BUY_TRAP_READY
+        passive_ok = spread_ticks <= float(self.settings.get("max_spread_ticks", 3)) and self.child_bid > 0 and self.child_ask > 0
+        mode = "BUY_TRAP" if mode_cfg == "BUY_TRAP" else "PASSIVE"
+        if mode_cfg == "AUTO_SAFE":
+            mode = "BUY_TRAP" if trap_ok else "PASSIVE" if passive_ok else "WAIT"
+        self.live_mode = mode
+        if self.live_state == "IDLE":
+            if not self.arm_test_checkbox.isChecked(): self.live_block_reason = "live_armed=false"; return
+            if self.settings.get("DRY_RUN", True): self.live_block_reason = "dry_run=true"; return
+            if self.api_status != "CONNECTED": self.live_block_reason = "api_disconnected"; return
+            if not self.symbol_can_trade or not self.filters_loaded: self.live_block_reason = "symbol/filters"; return
+            if mode == "WAIT": self.live_block_reason = "mode_wait"; return
+            if mode == "BUY_TRAP" and not trap_ok: self.live_block_reason = "buy_trap_gate"; return
+            if mode == "PASSIVE" and not passive_ok: self.live_block_reason = "passive_gate"; return
+            tick = self.symbol_filters["tickSize"]; step = self.symbol_filters["stepSize"]; min_notional = self.symbol_filters["minNotional"]
+            qty = self._norm_floor(float(self.settings.get("order_size_euri", 50.0)), step)
+            base_price = self.child_ask if mode == "BUY_TRAP" else max(tick, self.child_bid - int(self.settings.get("buy_offset_ticks", 1)) * tick)
+            price = self._norm_floor(base_price, tick)
+            if qty * price < min_notional: qty = self._norm_ceil(min_notional * 1.02 / max(price, tick), step)
+            if self.api_usdt_balance < qty * price: self.live_block_reason = "insufficient_usdt"; return
+            cid = f"LUC_LIVE_{mode}_BUY_{int(time.time()*1000)}"
+            res = self._place_live_limit("BUY", qty, price, cid)
+            self.live_client_buy_id, self.live_order_id = cid, str(res.get("orderId", "-"))
+            self.live_qty, self.live_state, self.live_buy_started_ts = qty, "WAIT_BUY_FILL", time.time()
+            self.live_events.appendleft(f"BUY NEW {qty:.4f}@{price:.6f}")
+            return
+        if self.live_state == "WAIT_BUY_FILL":
+            o = self._binance_signed("GET", "/api/v3/order", {"symbol": "EURIUSDT", "origClientOrderId": self.live_client_buy_id})
+            st = str(o.get("status", "NEW"))
+            if st == "FILLED":
+                self.live_buy_filled_qty = float(o.get("executedQty", 0.0)); self.live_buy_quote = float(o.get("cummulativeQuoteQty", 0.0))
+                self.live_buy_avg_price = self.live_buy_quote / max(self.live_buy_filled_qty, 1e-9); self.live_entry_price = self.live_buy_avg_price; self.live_state = "PLACE_SELL"
+            elif time.time() - self.live_buy_started_ts > float(self.settings.get("order_timeout_sec", 20)):
+                self._binance_signed("DELETE", "/api/v3/order", {"symbol": "EURIUSDT", "origClientOrderId": self.live_client_buy_id}); self.live_state = "IDLE"
+            return
+        if self.live_state == "PLACE_SELL":
+            tick = self.symbol_filters["tickSize"]
+            target = self.live_buy_avg_price + int(self.settings.get("target_ticks", 1)) * tick
+            passive_min = self.child_ask + int(self.settings.get("sell_offset_ticks", 1)) * tick
+            sell_price = self._norm_ceil(max(target, passive_min if self.live_mode == "PASSIVE" else target), tick)
+            cid = f"LUC_LIVE_{self.live_mode}_SELL_{int(time.time()*1000)}"
+            res = self._place_live_limit("SELL", self.live_buy_filled_qty, sell_price, cid)
+            self.live_client_sell_id = cid; self.live_sell_started_ts = time.time(); self.live_state = "WAIT_SELL_FILL"; self.live_exit_price = sell_price
+            self.live_order_id = str(res.get("orderId", "-")); return
+        if self.live_state == "WAIT_SELL_FILL":
+            o = self._binance_signed("GET", "/api/v3/order", {"symbol": "EURIUSDT", "origClientOrderId": self.live_client_sell_id})
+            st = str(o.get("status", "NEW"))
+            if st == "FILLED":
+                self.live_sell_filled_qty = float(o.get("executedQty", 0.0)); self.live_sell_quote = float(o.get("cummulativeQuoteQty", 0.0))
+                self.live_sell_avg_price = self.live_sell_quote / max(self.live_sell_filled_qty, 1e-9)
+                pnl = self.live_sell_quote - self.live_buy_quote
+                self.live_realized_pnl += pnl; self.live_cycles += 1; self.live_wins += 1 if pnl > 0 else 0; self.live_losses += 1 if pnl < 0 else 0
+                self.live_last_closed_cycle = f"{self.live_mode} pnl={pnl:+.4f}"; self.live_state = "IDLE"
+            elif time.time() - self.live_sell_started_ts > float(self.settings.get("order_timeout_sec", 20)):
+                self._binance_signed("DELETE", "/api/v3/order", {"symbol": "EURIUSDT", "origClientOrderId": self.live_client_sell_id}); self.live_state = "PLACE_SELL"
+
     def _inventory_metrics(self, mark_price: float) -> tuple[float, float, float, float]:
-        total_value = self.paper_usdt + self.paper_euri * mark_price
-        skew = 0.0 if total_value <= 0 else ((self.paper_euri * mark_price) - self.paper_usdt) / total_value * 100
-        start_value = float(self.settings.get("paper_start_usdt", 1000.0)) + float(self.settings.get("paper_start_euri", 1000.0)) * mark_price
-        unrealized = sum((mark_price - lot["entry_price"]) * lot["qty"] for lot in self.paper_lots if lot["side"] == "BUY")
-        unrealized += sum((lot["entry_price"] - mark_price) * lot["qty"] for lot in self.paper_lots if lot["side"] == "SELL")
-        return total_value, skew, start_value, unrealized
+        total_value = self.api_usdt_balance + self.api_euri_balance * mark_price
+        skew = 0.0 if total_value <= 0 else ((self.api_euri_balance * mark_price) - self.api_usdt_balance) / total_value * 100
+        unrealized = 0.0
+        if self.live_buy_filled_qty > self.live_sell_filled_qty and self.live_buy_avg_price > 0:
+            unrealized = (mark_price - self.live_buy_avg_price) * (self.live_buy_filled_qty - self.live_sell_filled_qty)
+        return total_value, skew, 0.0, unrealized
 
     def _ledger_add(self, event_type: str, side: str, qty: float, price: float, realized_pnl: float, now_ts: float) -> None:
         self.paper_ledger.appendleft({
@@ -1323,7 +1433,6 @@ class LUCWindow(QMainWindow):
 
     def refresh_view(self) -> None:
         self.refresh_api_panel()
-        self.poll_test_order_statuses()
         parent_mid = (self.parent_bid + self.parent_ask) / 2 if self.parent_bid and self.parent_ask else 0.0
         child_mid = (self.child_bid + self.child_ask) / 2 if self.child_bid and self.child_ask else 0.0
         spread = self.child_ask - self.child_bid if self.child_bid and self.child_ask else 0.0
@@ -1456,7 +1565,11 @@ class LUCWindow(QMainWindow):
         self._regime_confidence = max(0, min(100, int(regime_score * 0.45 + metric_agreement * 0.30 + duration_bonus * 0.15 + regime_stability * 0.10)))
         self._update_regime(regime_candidate, regime_score, now_ts, regime_stability)
 
-        # legacy paper runtime removed: no simulated step execution
+        try:
+            self.run_live_cycle(gap_ticks=gap_ticks, spread_ticks=spread_ticks, tick_size=tick_size)
+        except Exception as exc:
+            self.live_block_reason = f"error:{exc}"
+            self.log(f"[ERROR] live cycle {exc}")
 
         self._state_duration = self._state_duration + 1 if state == self.current_state else 1
         self.state_age_hist.append(self._state_duration)
@@ -1496,19 +1609,18 @@ class LUCWindow(QMainWindow):
         transition_quality = "stable transition" if regime_stability >= 70 else "violent transition" if regime_stability <= 40 else "mixed transition"
 
         total_value, skew, _, unrealized = self._inventory_metrics(child_mid)
-        avg_ticks = self.paper_total_ticks / self.paper_cycles if self.paper_cycles else 0.0
-        avg_hold = self.paper_total_hold_sec / self.paper_cycles if self.paper_cycles else 0.0
-        trap_success = (self.paper_trap_success / self.paper_trap_attempts * 100.0) if self.paper_trap_attempts else 0.0
+        avg_ticks = ((self.live_sell_avg_price - self.live_buy_avg_price) / tick_size) if tick_size and self.live_cycles else 0.0
+        avg_hold = 0.0
 
-        self.inventory_labels["EURI"].setText(f"{self.paper_euri:.2f}")
-        self.inventory_labels["USDT"].setText(f"{self.paper_usdt:.2f}")
+        self.inventory_labels["EURI"].setText(f"{self.api_euri_balance:.2f}")
+        self.inventory_labels["USDT"].setText(f"{self.api_usdt_balance:.2f}")
         self.inventory_labels["total value"].setText(f"{total_value:.2f}")
         self.inventory_labels["skew"].setText(f"{skew:+.2f}%")
-        self.inventory_labels["realized pnl"].setText(f"{self.paper_realized_pnl:+.4f}")
+        self.inventory_labels["realized pnl"].setText(f"{self.live_realized_pnl:+.4f}")
         self.inventory_labels["unrealized pnl"].setText(f"{unrealized:+.4f}")
-        self.inventory_labels["open lots"].setText(str(len(self.paper_lots)))
+        self.inventory_labels["open lots"].setText("1" if self.live_state in {"WAIT_BUY_FILL", "PLACE_SELL", "WAIT_SELL_FILL"} else "0")
 
-        self.engine_labels["engine status"].setText("STARTED" if self.paper_engine_enabled else "STOPPED")
+        self.engine_labels["engine status"].setText("STARTED" if self.trading_enabled else "STOPPED")
         self.api_labels["api status"].setText(self.api_status)
         can_trade = "YES" if self.symbol_can_trade else "NO"
         self.api_labels["account status"].setText(f"{self.account_status} canTrade={can_trade}")
@@ -1517,7 +1629,7 @@ class LUCWindow(QMainWindow):
         self.api_labels["USDT balance"].setText(f"{self.api_usdt_balance:.4f}")
         self.api_labels["open orders"].setText(str(self.api_open_orders_count))
         self.api_labels["last order status"].setText(self.last_order_status)
-        orders = list(self.test_orders.values())
+        orders = []
         for i in range(5):
             key = f"order {i+1}"
             if i < len(orders):
@@ -1525,24 +1637,24 @@ class LUCWindow(QMainWindow):
                 self.api_labels[key].setText(f"{o['order_id']} {o['side']} {o['qty']:.4f} {o['price']:.6f} {o['status']}")
             else:
                 self.api_labels[key].setText("-")
-        events = list(self.test_order_events)
+        events = list(self.live_events)
         for i in range(5):
             self.api_labels[f"event {i+1}"].setText(events[i] if i < len(events) else "-")
-        self.engine_labels["live state"].setText(self.paper_state.value)
-        self.engine_labels["active cycle"].setText(f"{self.paper_last_cycle} [{self.paper_cycle_source}]")
-        self.session_labels["cycles"].setText(str(self.paper_cycles))
-        self.session_labels["wins"].setText(str(self.paper_wins))
-        self.session_labels["losses"].setText(str(self.paper_losses))
-        self.session_labels["winrate"].setText(f"{(self.paper_wins / self.paper_cycles * 100.0) if self.paper_cycles else 0.0:.1f}%")
-        self.session_labels["avg pnl"].setText(f"{(self.paper_realized_pnl / self.paper_cycles) if self.paper_cycles else 0.0:+.4f}")
+        self.engine_labels["live state"].setText(self.live_state)
+        self.engine_labels["active cycle"].setText(self.live_last_closed_cycle)
+        self.session_labels["cycles"].setText(str(self.live_cycles))
+        self.session_labels["wins"].setText(str(self.live_wins))
+        self.session_labels["losses"].setText(str(self.live_losses))
+        self.session_labels["winrate"].setText(f"{(self.live_wins / self.live_cycles * 100.0) if self.live_cycles else 0.0:.1f}%")
+        self.session_labels["avg pnl"].setText(f"{(self.live_realized_pnl / self.live_cycles) if self.live_cycles else 0.0:+.4f}")
         self.session_labels["avg ticks"].setText(f"{avg_ticks:+.2f}")
         self.session_labels["avg hold"].setText(f"{avg_hold:.1f}s")
         entry_age = max(0, self.euri_snapshot_id - self.last_entry_snapshot_id) if self.last_entry_snapshot_id >= 0 else 0
-        cool_left = max(0.0, (self.paper_last_close_ts + float(self.settings.get("paper_cycle_cooldown_sec", 7.0))) - now_ts)
-        hold_left = max(0.0, (self.paper_entry_ts + float(self.settings.get("paper_min_hold_sec", 4.0))) - now_ts) if self.paper_entry_ts else 0.0
-        cycles_min = len(self.paper_cycle_timestamps)
-        self.engine_labels["entry block reason"].setText(self.paper_entry_block_reason)
-        self.engine_labels["fill quality"].setText(f"{self.paper_fill_quality}")
+        cool_left = 0.0
+        hold_left = 0.0
+        cycles_min = self.live_cycles
+        self.engine_labels["entry block reason"].setText(self.live_block_reason)
+        self.engine_labels["fill quality"].setText("-")
         self.engine_labels["cooldown"].setText(f"{cool_left:.1f}s")
         self.engine_labels["min hold"].setText(f"{hold_left:.1f}s")
         self.engine_labels["cycles/min"].setText(str(cycles_min))
@@ -1552,10 +1664,10 @@ class LUCWindow(QMainWindow):
         anchor1 = min(float(self.settings.get("budget_anchor", 0.0)) * 0.20, float(self.settings.get("sizing_max_order_size", 200.0)))
         anchor2 = min(float(self.settings.get("budget_anchor", 0.0)) * 0.30, float(self.settings.get("sizing_max_order_size", 200.0)))
         anchor3 = min(float(self.settings.get("budget_anchor", 0.0)) * 0.50, float(self.settings.get("sizing_max_order_size", 200.0)))
-        used_budget = 0.0 if float(self.settings.get("budget_total", 1.0)) <= 0 else min(100.0, (self.paper_trapped_euri * child_mid) / float(self.settings.get("budget_total", 1.0)) * 100.0)
+        used_budget = 0.0 if float(self.settings.get("budget_total", 1.0)) <= 0 else min(100.0, ((self.live_buy_filled_qty - self.live_sell_filled_qty) * child_mid) / float(self.settings.get("budget_total", 1.0)) * 100.0)
         inv_factor = cp.get("passive", {}).get("inventory_factor", 1.0)
         rnd_factor = cp.get("passive", {}).get("random_factor", 1.0)
-        active_mode = self.paper_cycle_source if self.paper_cycle_source != "NONE" else "IDLE"
+        active_mode = self.live_mode
         self.sizing_labels["passive size"].setText(f"{passive_rec:.2f}")
         self.sizing_labels["trap size"].setText(f"{trap_rec:.2f}")
         self.sizing_labels["anchor layer 1"].setText(f"{anchor1:.2f}")
@@ -1564,12 +1676,11 @@ class LUCWindow(QMainWindow):
         self.sizing_labels["budget used %"].setText(f"{used_budget:.1f}%")
         self.sizing_labels["random factor"].setText(f"{rnd_factor:.2f}")
         for idx, key in enumerate(["event 1", "event 2", "event 3", "event 4", "event 5"]):
-            if idx < len(self.paper_ledger):
-                evt = self.paper_ledger[idx]
-                self.ledger_labels[key].setText(f"{evt['timestamp']} {evt['type']} {evt['side']} {evt['qty']:.2f} pnl={evt['realized_pnl']:+.4f}")
+            if idx < len(self.live_events):
+                self.ledger_labels[key].setText(self.live_events[idx])
             else:
-                if idx == 0 and not self.paper_engine_enabled:
-                    self.ledger_labels[key].setText("Paper stopped")
+                if idx == 0 and not self.trading_enabled:
+                    self.ledger_labels[key].setText("Live stopped")
                 elif idx == 0:
                     self.ledger_labels[key].setText("Нет событий — нажмите START или ждём условия входа")
                 else:
