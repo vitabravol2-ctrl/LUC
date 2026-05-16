@@ -38,7 +38,7 @@ CONFIG_PATH = Path(__file__).resolve().parent / "config" / "settings.json"
 
 def default_settings() -> dict:
     return {
-        "version": "0.1.9",
+        "version": "0.1.11",
         "binance_api_key": "",
         "binance_api_secret": "",
         "use_testnet": False,
@@ -381,7 +381,7 @@ class LUCTerminal(QMainWindow):
         self.settings = self._load_settings()
         self.thread: QThread | None = None
         self.worker: ConnectWorker | None = None
-        self.setWindowTitle("LUC v0.1.9 — Full Auto Mode + Trade Log System")
+        self.setWindowTitle("LUC v0.1.11 — Balance Refresh Fix + Smart Runtime Logging")
         self.resize(1520, 920)
         self.runtime = self._default_runtime()
         self.log_file = self._open_log_file()
@@ -408,7 +408,7 @@ class LUCTerminal(QMainWindow):
         self._update_trading_button()
         self.last_status = {"api": "DISCONNECTED", "eur": "IDLE", "euri": "IDLE"}
         self.runtime.update({"euri_poll_count": 0, "euri_stale_count": 0, "eur_ticks": [], "active_orders_count": 0, "cycles": 0, "wins": 0, "losses": 0, "realized_pnl": 0.0, "unrealized_pnl": 0.0, "tick_capture": 0})
-        self._append_log("[v0.1.9] GUI cockpit initialized")
+        self._append_log("[v0.1.11] GUI cockpit initialized")
         self._append_log("[STABILITY] hysteresis enabled")
         self._append_log("[THEME] dark theme enabled")
         self._append_log("[SAFETY] No market data yet. No trading actions.")
@@ -441,10 +441,17 @@ class LUCTerminal(QMainWindow):
             "last_order_error": "",
             "execution_cooldown_until": 0.0,
             "last_block_reason": "",
+            "last_execution_block_reason": "",
+            "last_fair_gap_zone": None,
+            "last_balance_refresh_ts": 0.0,
+            "last_balance_change_ts": 0.0,
+            "last_log_event_key": "",
             "proposed_notional": 0.0,
             "min_notional": 0.0,
             "failed_order_keys": {},
             "last_error_log_times": {},
+            "log_events": {},
+            "order_status_by_id": {},
         }
 
     def _open_log_file(self):
@@ -467,7 +474,7 @@ class LUCTerminal(QMainWindow):
         return deep_merge(base, loaded)
 
     def _save_settings(self) -> None:
-        self.settings["version"] = "0.1.9"
+        self.settings["version"] = "0.1.11"
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
         with CONFIG_PATH.open("w", encoding="utf-8") as file:
             json.dump(self.settings, file, indent=2, ensure_ascii=False)
@@ -499,6 +506,17 @@ class LUCTerminal(QMainWindow):
             fh.write(msg + "\n")
             fh.flush()
 
+    def _log_once_or_changed(self, key: str, message: str, min_interval_sec: int = 10) -> None:
+        now = time.time()
+        events = self.runtime.setdefault("log_events", {})
+        event = events.get(key, {"last_message": None, "last_ts": 0.0})
+        message_changed = event.get("last_message") != message
+        time_elapsed = now - float(event.get("last_ts", 0.0)) >= float(min_interval_sec)
+        if message_changed or time_elapsed:
+            self._append_log(message)
+            events[key] = {"last_message": message, "last_ts": now}
+            self.runtime["last_log_event_key"] = key
+
     def _status_label(self, text: str) -> QLabel:
         label = QLabel(text)
         label.setFrameShape(QFrame.Shape.StyledPanel)
@@ -519,7 +537,7 @@ class LUCTerminal(QMainWindow):
         self.setCentralWidget(central)
 
         top = QHBoxLayout()
-        self.version_label = self._status_label("LUC VERSION: 0.1.9")
+        self.version_label = self._status_label("LUC VERSION: 0.1.11")
         self.api_status_label = self._status_label("API STATUS: DISCONNECTED")
         self.eur_status = self._status_label("EURUSDT STATUS: IDLE")
         self.euri_status = self._status_label("EURIUSDT STATUS: IDLE")
@@ -693,7 +711,10 @@ class LUCTerminal(QMainWindow):
         data = json.loads(message)
         bid, ask = float(data.get("b", 0)), float(data.get("a", 0))
         now = time.time()
+        first = not self.runtime.get("eur")
         self.runtime["eur"] = {"bid": bid, "ask": ask, "mid": (bid + ask) / 2, "time": now, "source": "ws:bookTicker"}
+        if first:
+            self._append_log("[DATA] first EUR tick")
         self.eur_mid.setText(f"{self.runtime['eur']['mid']:.6f}")
         self._set_market_status(self.eur_status, "EURUSDT STATUS: LIVE", "eur")
         self.runtime["eur_ticks"] = [t for t in self.runtime["eur_ticks"] if now - t < 60] + [now]
@@ -709,7 +730,7 @@ class LUCTerminal(QMainWindow):
             self.runtime["euri"] = {"bid": bid, "ask": ask, "mid": (bid + ask) / 2, "spread_ticks": self._ticks(ask - bid), "time": now, "source": "http:bookTicker"}
             self.runtime["euri_poll_count"] += 1
             if first:
-                self._append_log("[HTTP] EURIUSDT first data")
+                self._append_log("[DATA] first EURI tick")
             self.euri_bid.setText(f"{bid:.6f}")
             self.euri_ask.setText(f"{ask:.6f}")
             self.euri_spread.setText(str(self.runtime["euri"]["spread_ticks"]))
@@ -730,6 +751,16 @@ class LUCTerminal(QMainWindow):
         gap = eur["mid"] - euri["mid"]
         self.runtime["fair_gap"] = gap
         self.runtime["fair_gap_ticks"] = self._ticks(gap)
+        gap_zone = "NONE"
+        trap_min_gap = int(self.settings.get("trap", {}).get("trap_min_gap_ticks", 2))
+        if self.runtime["fair_gap_ticks"] is not None:
+            if self.runtime["fair_gap_ticks"] >= trap_min_gap:
+                gap_zone = "BUY_ZONE"
+            elif self.runtime["fair_gap_ticks"] <= -trap_min_gap:
+                gap_zone = "SELL_ZONE"
+        if self.runtime.get("last_fair_gap_zone") != gap_zone:
+            self._append_log(f"[DATA] fair_gap zone changed: {self.runtime.get('last_fair_gap_zone')} -> {gap_zone}")
+            self.runtime["last_fair_gap_zone"] = gap_zone
         self._update_decisions()
 
     def _evaluate_inventory_zone(self, euri_total: float, usdt_total: float, euri_mid: float) -> tuple[str, float | None]:
@@ -952,6 +983,10 @@ class LUCTerminal(QMainWindow):
         if last["inventory_zone"] != d["inventory_zone"]:
             self._append_log(f"[INVENTORY] zone changed: {last['inventory_zone']} -> {d['inventory_zone']}")
             last["inventory_zone"] = d["inventory_zone"]
+        self._log_once_or_changed("decision_passive_block_reason", f"[DECISION] passive block reason: {d['passive_block_reason']}", 10)
+        self._log_once_or_changed("decision_trap_block_reason", f"[DECISION] trap block reason: {d['trap_block_reason']}", 10)
+        score_band = d.get("trap_stability", "DISABLED") if d.get("current_mode") == "AGGRESSIVE_TRAP" else d.get("passive_stability", "LOW")
+        self._log_once_or_changed("decision_score_band", f"[DECISION] score band: {score_band}", 10)
 
     def _update_market_status(self):
         general = self.settings.get("general", {})
@@ -967,8 +1002,10 @@ class LUCTerminal(QMainWindow):
             current = "LIVE" if "LIVE" in label.text() else "STALE" if "STALE" in label.text() else "IDLE"
             if current == "LIVE" and age_ms > stale_ms + hysteresis_ms:
                 self.runtime["euri_stale_count"] += 1 if key == "euri" else 0
+                self._log_once_or_changed(f"data_{key}_stale_live", f"[DATA] {key.upper()} age became stale", 10)
                 self._set_market_status(label, prefix + "STALE", key)
             elif current == "STALE" and age_ms < stale_ms:
+                self._log_once_or_changed(f"data_{key}_stale_live", f"[DATA] {key.upper()} age became live", 10)
                 self._set_market_status(label, prefix + "LIVE", key)
 
 
@@ -981,7 +1018,7 @@ class LUCTerminal(QMainWindow):
         general["trading_enabled"] = not bool(general.get("trading_enabled", False))
         self._save_settings()
         state = "enabled" if general["trading_enabled"] else "disabled"
-        self._append_log(f"[TRADING] trading {state}")
+        self._log_once_or_changed("execution_trading_state", f"[EXECUTION] trading {state}", 2)
         self._update_trading_button()
 
     def _prepare_order(self) -> dict | None:
@@ -995,12 +1032,16 @@ class LUCTerminal(QMainWindow):
         cooldown_until = float(self.runtime.get("execution_cooldown_until", 0.0))
         if now < cooldown_until:
             self.runtime["last_block_reason"] = "LAST_ERROR_COOLDOWN"
+            self.runtime["last_execution_block_reason"] = "LAST_ERROR_COOLDOWN"
             return None
         if not bool(general.get("trading_enabled", False)) or not bool(general.get("allow_auto_orders", True)):
+            self.runtime["last_execution_block_reason"] = "TRADING_DISABLED"
             return None
         if d.get("current_mode") == "WAIT" or self.runtime.get("active_orders_count", 0) > 0 or not d.get("data_fresh"):
+            self.runtime["last_execution_block_reason"] = "WAIT_OR_ACTIVE_ORDERS_OR_STALE"
             return None
         if not bool(risk.get("no_market_orders", True)):
+            self.runtime["last_execution_block_reason"] = "MARKET_ORDERS_ALLOWED_BLOCK"
             return None
         mode = d.get("current_mode")
         side = None
@@ -1017,7 +1058,9 @@ class LUCTerminal(QMainWindow):
         elif mode == "PASSIVE_CORRIDOR":
             side, qty, price, reason, target = "BUY", float(passive.get("passive_order_size", 1.0)), float(euri.get("bid", 0.0)), "PASSIVE_CORRIDOR recycle", "sell corridor"
         if not side or qty <= 0 or price <= 0:
+            self.runtime["last_execution_block_reason"] = "INVALID_PROPOSAL"
             return None
+        self.runtime["last_execution_block_reason"] = "NONE"
         return self._preflight_order({"mode": mode, "side": side, "symbol": "EURIUSDT", "price": price, "qty": qty, "reason": reason, "target": target})
 
     @staticmethod
@@ -1084,18 +1127,21 @@ class LUCTerminal(QMainWindow):
     def _execute_auto_order(self) -> None:
         now = time.time()
         if now < float(self.runtime.get("execution_cooldown_until", 0.0)):
-            self._append_log("[EXECUTION] BLOCKED / LAST_ERROR_COOLDOWN")
+            self._log_once_or_changed("execution_blocked_reason", "[EXECUTION] blocked reason: LAST_ERROR_COOLDOWN", 10)
             return
         order = self._prepare_order()
         if not order:
+            reason = self.runtime.get("last_execution_block_reason", "UNKNOWN")
+            if reason and reason != "NONE":
+                self._log_once_or_changed("execution_blocked_reason", f"[EXECUTION] blocked reason: {reason}", 10)
             return
         dedup_key = f"{order['side']}|{order['price']:.8f}|{order['qty']:.8f}|{order['reason']}"
         failed_keys = self.runtime.setdefault("failed_order_keys", {})
         if dedup_key in failed_keys and now - float(failed_keys[dedup_key]) <= 30:
             self.runtime["last_block_reason"] = "DUPLICATE_FAILED_PROPOSAL"
-            self._append_log("[ORDER_BLOCKED] duplicate failed proposal cooldown")
+            self._log_once_or_changed("order_blocked_preflight", "[ORDER_BLOCKED] duplicate failed proposal cooldown", 10)
             return
-        self._append_log(f"[ORDER] proposed order: {order['side']} {order['qty']:.6f} {order['symbol']} @ {order['price']:.6f} ({order['reason']})")
+        self._append_log(f"[ORDER] order proposal created: {order['side']} {order['qty']:.6f} {order['symbol']} @ {order['price']:.6f} ({order['reason']})")
         self._append_log("[EXECUTION] auto order approved")
         try:
             if not self.client:
@@ -1145,6 +1191,12 @@ class LUCTerminal(QMainWindow):
             self.active_orders_view.setPlainText("\n".join(lines) if lines else "No active orders.")
             if prev_count != len(orders):
                 self._append_log(f"[ORDER] open orders count changed: {prev_count} -> {len(orders)}")
+            prev_statuses = self.runtime.setdefault("order_status_by_id", {})
+            current_statuses = {str(o.get("orderId")): str(o.get("status")) for o in orders if o.get("orderId") is not None}
+            for order_id, status in current_statuses.items():
+                if prev_statuses.get(order_id) != status:
+                    self._append_log(f"[ORDER] status changed: id={order_id} {prev_statuses.get(order_id)} -> {status}")
+            self.runtime["order_status_by_id"] = current_statuses
         except Exception as exc:
             self._append_log(f"[ORDER] open orders refresh error: {exc}")
 
@@ -1191,12 +1243,22 @@ class LUCTerminal(QMainWindow):
         if not self.client:
             return
         try:
-            balances = self.client.get_account_balances(["EURI", "USDT"])
+            balances = self.client.get_balances(["EURI", "USDT"])
             euri = balances.get("EURI", {"free": 0, "locked": 0, "total": 0})
             usdt = balances.get("USDT", {"free": 0, "locked": 0, "total": 0})
+            prev_euri_total = self._parse_total(self.euri_bal.text())
+            prev_usdt_total = self._parse_total(self.usdt_bal.text())
             self.euri_bal.setText(f"free={euri['free']:.8f} / locked={euri['locked']:.8f} / total={euri['total']:.8f}")
             self.usdt_bal.setText(f"free={usdt['free']:.8f} / locked={usdt['locked']:.8f} / total={usdt['total']:.8f}")
-            self._append_log("[ACCOUNT] balances refreshed")
+            self.runtime["last_balance_refresh_ts"] = time.time()
+            inventory_zone, _ = self._evaluate_inventory_zone(euri["total"], usdt["total"], self.runtime.get("euri", {}).get("mid", 0.0))
+            self.inventory_zone.setText(f"INVENTORY ZONE: {inventory_zone}")
+            changed = abs(prev_euri_total - float(euri["total"])) > 1e-9 or abs(prev_usdt_total - float(usdt["total"])) > 1e-9
+            if changed:
+                self.runtime["last_balance_change_ts"] = time.time()
+                self._append_log(f"[ACCOUNT] balances changed euri={euri['total']:.8f} usdt={usdt['total']:.8f}")
+            else:
+                self._log_once_or_changed("balances_ok", f"[ACCOUNT] balances ok euri={euri['total']:.8f} usdt={usdt['total']:.8f}", 60)
         except Exception as exc:
             self._append_log(f"[ACCOUNT] balances refresh error: {exc}")
 
@@ -1249,11 +1311,16 @@ Filters
 {self.filters_label.text()}
 
 Runtime
-app_version=0.1.9 uptime={int(now-self.started_at)}s current_mode={self.mode_label.text()} active_orders_count={self.runtime['active_orders_count']}
+app_version=0.1.11 uptime={int(now-self.started_at)}s current_mode={self.mode_label.text()} active_orders_count={self.runtime['active_orders_count']}
 cycles={self.runtime['cycles']} wins/losses={self.runtime['wins']}/{self.runtime['losses']} realized/unrealized_pnl={self.runtime['realized_pnl']}/{self.runtime['unrealized_pnl']} tick_capture={self.runtime['tick_capture']}
 last_order_error={self.runtime.get('last_order_error')}
 execution_cooldown_until={self.runtime.get('execution_cooldown_until')}
 last_block_reason={self.runtime.get('last_block_reason')}
+last_execution_block_reason={self.runtime.get('last_execution_block_reason')}
+last_balance_refresh_ts={self.runtime.get('last_balance_refresh_ts')}
+last_balance_change_ts={self.runtime.get('last_balance_change_ts')}
+last_fair_gap_zone={self.runtime.get('last_fair_gap_zone')}
+last_log_event_key={self.runtime.get('last_log_event_key')}
 proposed_notional={self.runtime.get('proposed_notional')}
 min_notional={self.runtime.get('min_notional')}
 
