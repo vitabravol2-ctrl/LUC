@@ -60,6 +60,11 @@ DEFAULT_SETTINGS = {
     "refill_recovery_ticks": 1.0,
     "spread_compressed_ticks": 1.2,
     "spread_unstable_ticks": 4.0,
+    "regime_enter_threshold": 75,
+    "regime_exit_threshold": 60,
+    "regime_activation_delay_sec": 6.0,
+    "regime_cooldown_sec": 5.0,
+    "regime_confidence_jump_log": 12,
 }
 
 
@@ -76,6 +81,16 @@ class MarketState(str, Enum):
     STALE_CHILD = "STALE_CHILD"
 
 
+
+
+
+class Regime(str, Enum):
+    IDEAL_PASSIVE = "IDEAL_PASSIVE"
+    IDEAL_TRAP = "IDEAL_TRAP"
+    NEUTRAL = "NEUTRAL"
+    CAUTION = "CAUTION"
+    DANGEROUS = "DANGEROUS"
+    ESCAPE = "ESCAPE"
 
 class BasicSettingsDialog(QDialog):
     def __init__(self, settings: dict[str, Any], parent: QWidget | None = None) -> None:
@@ -221,6 +236,15 @@ class LUCWindow(QMainWindow):
         self._last_gap_sign: int = 0
         self._state_duration = 0
         self._last_micro_log: dict[str, str] = {}
+        self.current_regime = Regime.NEUTRAL
+        self._regime_candidate = Regime.NEUTRAL
+        self._regime_candidate_since = time.time()
+        self._regime_since = time.time()
+        self._regime_cooldown_until = 0.0
+        self._regime_confidence = 50
+        self._regime_transition_count = 0
+        self._regime_last_transition = "INIT -> NEUTRAL"
+        self._regime_confidence_bucket = 5
         self.last_child_update_ts = 0.0
         self.current_state = MarketState.WAIT
         self.corridor_state = MarketState.WAIT
@@ -298,6 +322,9 @@ class LUCWindow(QMainWindow):
         self.micro_labels = self.make_panel(grid, 2, 1, "Microstructure", [
             "equilibrium score", "passive viability", "trap survivability", "refill strength",
             "spread state", "churn quality", "center stability", "mean reversion quality", "market class",
+        ])
+        self.regime_labels = self.make_panel(grid, 3, 0, "Regime Panel", [
+            "current regime", "regime confidence", "regime duration", "last transition", "transition cooldown", "regime stability",
         ])
         layout.addLayout(grid)
 
@@ -461,6 +488,67 @@ class LUCWindow(QMainWindow):
             return "#FF6E6E"
         return "#b7bdc8"
 
+    def _regime_color(self, regime: Regime) -> str:
+        if regime in {Regime.IDEAL_PASSIVE, Regime.IDEAL_TRAP}:
+            return "#7CFC8A"
+        if regime == Regime.NEUTRAL:
+            return "#6FA8FF"
+        if regime == Regime.CAUTION:
+            return "#FFB366"
+        return "#FF6E6E"
+
+    def _set_regime_label(self, name: str, value: str, regime: Regime | None = None) -> None:
+        label = self.regime_labels[name]
+        color = self._regime_color(regime) if regime else "#b7bdc8"
+        label.setText(value)
+        label.setStyleSheet(f"color: {color}; font-weight: bold;")
+
+    def _pick_regime_candidate(self, equilibrium_score: int, passive_viability: int, trap_survivability: int, corridor_stable: bool, spread_state: str, refill_strength: str, churn_quality: str, parent_impulse: bool, stale_state: bool, mean_reversion_quality: int) -> tuple[Regime, int]:
+        ideal_passive_score = int(equilibrium_score * 0.35 + passive_viability * 0.45 + (100 if refill_strength == "WEAK_REFILL" else 55 if refill_strength == "NORMAL_REFILL" else 20) * 0.20)
+        ideal_trap_score = int(trap_survivability * 0.50 + (100 if corridor_stable else 45) * 0.30 + mean_reversion_quality * 0.20)
+        danger_score = int((100 if parent_impulse else 40) * 0.30 + (100 if spread_state == "UNSTABLE" else 55 if spread_state == "EXPANDING" else 20) * 0.30 + (100 if churn_quality == "CHAOTIC" else 45) * 0.20 + (100 if stale_state else 35) * 0.20)
+        if stale_state and (spread_state == "UNSTABLE" or mean_reversion_quality < 35):
+            return Regime.ESCAPE, max(80, danger_score)
+        if ideal_passive_score >= ideal_trap_score and ideal_passive_score >= 70:
+            return Regime.IDEAL_PASSIVE, ideal_passive_score
+        if ideal_trap_score >= 70:
+            return Regime.IDEAL_TRAP, ideal_trap_score
+        if danger_score >= 70:
+            return Regime.DANGEROUS, danger_score
+        if danger_score >= 55 or spread_state in {"EXPANDING", "UNSTABLE"}:
+            return Regime.CAUTION, max(danger_score, 55)
+        return Regime.NEUTRAL, int((equilibrium_score + mean_reversion_quality) / 2)
+
+    def _update_regime(self, candidate: Regime, score: int, now_ts: float, stability: int) -> None:
+        enter_thr = int(self.settings.get("regime_enter_threshold", 75))
+        exit_thr = int(self.settings.get("regime_exit_threshold", 60))
+        hold_sec = float(self.settings.get("regime_activation_delay_sec", 6.0))
+        cooldown_sec = float(self.settings.get("regime_cooldown_sec", 5.0))
+        if candidate != self._regime_candidate:
+            self._regime_candidate = candidate
+            self._regime_candidate_since = now_ts
+        if now_ts < self._regime_cooldown_until and candidate != self.current_regime:
+            return
+        if candidate == self.current_regime:
+            return
+        threshold = enter_thr
+        if self.current_regime in {Regime.IDEAL_PASSIVE, Regime.IDEAL_TRAP} and candidate in {Regime.NEUTRAL, Regime.CAUTION, Regime.DANGEROUS}:
+            threshold = exit_thr
+        if score < threshold:
+            return
+        if now_ts - self._regime_candidate_since < hold_sec:
+            return
+        prev = self.current_regime
+        self.current_regime = candidate
+        self._regime_since = now_ts
+        self._regime_transition_count += 1
+        self._regime_cooldown_until = now_ts + cooldown_sec
+        self._regime_last_transition = f"{prev.value} -> {candidate.value}"
+        self.log(f"[REGIME] transition {self._regime_last_transition}")
+        self.log(f"[REGIME] {candidate.value} activated confidence={self._regime_confidence}")
+        if abs(stability - 50) >= 30:
+            self.log(f"[REGIME] {'stable' if stability >= 70 else 'violent'} transition")
+
     def _set_micro_label(self, name: str, value: str, level: str) -> None:
         label = self.micro_labels[name]
         label.setText(value)
@@ -597,6 +685,13 @@ class LUCWindow(QMainWindow):
             churn_quality = "CALM"
 
         market_class = "IDEAL_MARKET" if (spread_state in {"COMPRESSED", "NORMAL"} and refill_strength == "WEAK_REFILL" and equilibrium_score >= 70 and passive_viability >= 70) else "DANGEROUS_MARKET" if (spread_state == "UNSTABLE" or self.parent_state == MarketState.PARENT_IMPULSE or refill_strength == "AGGRESSIVE_REFILL" or mean_reversion_quality < 45) else "CAUTION_MARKET"
+        regime_candidate, regime_score = self._pick_regime_candidate(equilibrium_score, passive_viability, trap_survivability, corridor_stable, spread_state, refill_strength, churn_quality, self.parent_state == MarketState.PARENT_IMPULSE, self.stale_state == MarketState.STALE_CHILD, mean_reversion_quality)
+        regime_duration = now_ts - self._regime_since
+        metric_agreement = max(0, 100 - int(abs(equilibrium_score - passive_viability) * 0.7 + abs(passive_viability - trap_survivability) * 0.3))
+        duration_bonus = min(100, int(regime_duration * 5))
+        regime_stability = max(0, 100 - min(90, self._regime_transition_count * 6))
+        self._regime_confidence = max(0, min(100, int(regime_score * 0.45 + metric_agreement * 0.30 + duration_bonus * 0.15 + regime_stability * 0.10)))
+        self._update_regime(regime_candidate, regime_score, now_ts, regime_stability)
 
         self._state_duration = self._state_duration + 1 if state == self.current_state else 1
         self.state_age_hist.append(self._state_duration)
@@ -650,6 +745,19 @@ class LUCWindow(QMainWindow):
         self._log_micro_change("trap", f"trap_survivability={trap_survivability}")
         if market_class == "DANGEROUS_MARKET":
             self._log_micro_change("danger", "dangerous_market")
+
+        confidence_bucket = self._regime_confidence // max(1, int(self.settings.get("regime_confidence_jump_log", 12)))
+        if confidence_bucket != self._regime_confidence_bucket:
+            self._regime_confidence_bucket = confidence_bucket
+            self.log(f"[REGIME] {self.current_regime.value} confidence={self._regime_confidence}")
+        cooldown_left = max(0.0, self._regime_cooldown_until - now_ts)
+        transition_quality = "stable transition" if regime_stability >= 70 else "violent transition" if regime_stability <= 40 else "mixed transition"
+        self._set_regime_label("current regime", self.current_regime.value, self.current_regime)
+        self._set_regime_label("regime confidence", f"{self._regime_confidence}", self.current_regime)
+        self._set_regime_label("regime duration", f"{regime_duration:.1f}s", self.current_regime)
+        self._set_regime_label("last transition", self._regime_last_transition, self.current_regime)
+        self._set_regime_label("transition cooldown", f"{cooldown_left:.1f}s", self.current_regime)
+        self._set_regime_label("regime stability", f"{regime_stability} ({transition_quality})", self.current_regime)
 
         self.inventory_labels["EURI balance"].setText("1000.00")
         self.inventory_labels["USDT balance"].setText("1000.00")
