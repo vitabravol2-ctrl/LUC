@@ -38,7 +38,7 @@ CONFIG_PATH = Path(__file__).resolve().parent / "config" / "settings.json"
 
 def default_settings() -> dict:
         return {
-            "version": "0.2.3",
+            "version": "0.2.4",
         "binance_api_key": "",
         "binance_api_secret": "",
         "use_testnet": False,
@@ -80,6 +80,8 @@ def default_settings() -> dict:
             "trap_target_ticks": 1,
             "trap_order_size": 5.0,
             "trap_cooldown_sec": 3,
+            "trap_same_price_cooldown_sec": 60,
+            "trap_recycle_cooldown_sec": 7,
             "cancel_if_gap_gone": True,
         },
             "risk_inventory": {
@@ -1134,6 +1136,50 @@ class LUCTerminal(QMainWindow):
         self._append_log(f"[CYCLE] created {mode} #{cycle_id}")
         return cycle
 
+    @staticmethod
+    def _trap_quality(mode: str, fair_gap_ticks: int | None, spread_ticks: int | None, trap_min_gap_ticks: int) -> str:
+        if fair_gap_ticks is None or spread_ticks is None:
+            return "BAD"
+        directional_gap = fair_gap_ticks if mode == "BUY_TRAP" else -fair_gap_ticks
+        if directional_gap < trap_min_gap_ticks:
+            return "WEAK"
+        if spread_ticks >= 3:
+            return "BAD"
+        if directional_gap >= trap_min_gap_ticks + 1:
+            return "STRONG"
+        return "MEDIUM"
+
+    @staticmethod
+    def _trap_entry_price(mode: str, euri: dict, tick: float, spread_ticks: int | None, fair_gap_ticks: int | None) -> float | None:
+        bid = float(euri.get("bid", 0.0) or 0.0)
+        ask = float(euri.get("ask", 0.0) or 0.0)
+        if bid <= 0 or ask <= 0 or spread_ticks is None:
+            return None
+        directional_gap = fair_gap_ticks if mode == "BUY_TRAP" else -(fair_gap_ticks or 0)
+        if spread_ticks >= 3:
+            return None
+        if mode == "BUY_TRAP":
+            if directional_gap >= 3:
+                return ask
+            if spread_ticks == 1:
+                return bid
+            return max(bid, ask - tick)
+        if directional_gap >= 3:
+            return bid
+        if spread_ticks == 1:
+            return ask
+        return min(ask, bid + tick)
+
+    def _same_stale_price_cooldown_hit(self, mode: str, side: str, price: float) -> bool:
+        payload = self.runtime.get("last_stale_cancel", {})
+        if not isinstance(payload, dict):
+            return False
+        age = time.time() - float(payload.get("ts", 0.0))
+        cooldown = float(self.settings.get("trap", {}).get("trap_same_price_cooldown_sec", 60))
+        if age > cooldown:
+            return False
+        return payload.get("mode") == mode and payload.get("side") == side and abs(float(payload.get("price", 0.0)) - price) < 1e-12
+
     def _prepare_order(self) -> dict | None:
         d = self.runtime.get("decision", {})
         general = self.settings.get("general", {})
@@ -1166,12 +1212,34 @@ class LUCTerminal(QMainWindow):
         target_ticks = int(passive.get("passive_target_ticks", 1))
         if mode == "AGGRESSIVE_TRAP":
             if d.get("trap_direction") == "BUY_TRAP":
-                side, qty, price, reason, target = "BUY", float(trap.get("trap_order_size", 1.0)), float(euri.get("ask", 0.0)), "BUY_TRAP fair_gap", "SELL +1 tick"
+                side = "BUY"
+                qty = float(trap.get("trap_order_size", 1.0))
+                trap_quality = self._trap_quality("BUY_TRAP", d.get("fair_gap_ticks"), d.get("spread_ticks"), int(trap.get("trap_min_gap_ticks", 2)))
+                if trap_quality in {"WEAK", "BAD"}:
+                    self.runtime["last_execution_block_reason"] = "TRAP_QUALITY_WEAK"
+                    self._log_once_or_changed("cycle_blocked_weak_trap", "[CYCLE_BLOCKED] weak trap quality", 10)
+                    return None
+                price = self._trap_entry_price("BUY_TRAP", euri, tick=float(self.settings.get("general", {}).get("tick_size", 0.0001) or 0.0001), spread_ticks=d.get("spread_ticks"), fair_gap_ticks=d.get("fair_gap_ticks"))
+                if price is None:
+                    self.runtime["last_execution_block_reason"] = "TRAP_SPREAD_TOO_WIDE"
+                    return None
+                reason, target = f"BUY_TRAP {trap_quality}", "SELL +1 tick"
                 cycle_mode = "BUY_TRAP"
                 target_ticks = int(trap.get("trap_target_ticks", 1))
             elif d.get("trap_direction") == "SELL_TRAP":
                 free = self._parse_free(self.euri_bal.text())
-                side, qty, price, reason, target = "SELL", min(float(trap.get("trap_order_size", 1.0)), free), float(euri.get("bid", 0.0)), "SELL_TRAP fair_gap", "BUY -1 tick"
+                side = "SELL"
+                qty = min(float(trap.get("trap_order_size", 1.0)), free)
+                trap_quality = self._trap_quality("SELL_TRAP", d.get("fair_gap_ticks"), d.get("spread_ticks"), int(trap.get("trap_min_gap_ticks", 2)))
+                if trap_quality in {"WEAK", "BAD"}:
+                    self.runtime["last_execution_block_reason"] = "TRAP_QUALITY_WEAK"
+                    self._log_once_or_changed("cycle_blocked_weak_trap", "[CYCLE_BLOCKED] weak trap quality", 10)
+                    return None
+                price = self._trap_entry_price("SELL_TRAP", euri, tick=float(self.settings.get("general", {}).get("tick_size", 0.0001) or 0.0001), spread_ticks=d.get("spread_ticks"), fair_gap_ticks=d.get("fair_gap_ticks"))
+                if price is None:
+                    self.runtime["last_execution_block_reason"] = "TRAP_SPREAD_TOO_WIDE"
+                    return None
+                reason, target = f"SELL_TRAP {trap_quality}", "BUY -1 tick"
                 cycle_mode = "SELL_TRAP"
                 target_ticks = int(trap.get("trap_target_ticks", 1))
         elif mode == "PASSIVE_CORRIDOR":
@@ -1186,11 +1254,19 @@ class LUCTerminal(QMainWindow):
             return None
         self.runtime["last_execution_block_reason"] = "NONE"
         proposal = {"mode": mode, "cycle_mode": cycle_mode, "target_ticks": target_ticks, "side": side, "symbol": "EURIUSDT", "price": price, "qty": qty, "reason": reason, "target": target}
+        if cycle_mode in {"BUY_TRAP", "SELL_TRAP"} and self._same_stale_price_cooldown_hit(cycle_mode, side, float(price)):
+            self.runtime["last_execution_block_reason"] = "SAME_STALE_PRICE_COOLDOWN"
+            self._log_once_or_changed("cycle_blocked_same_stale_price", "[CYCLE_BLOCKED] same stale price cooldown", 10)
+            return None
         preflight = self._preflight_order(proposal)
         if not preflight:
             return None
         last_created = float(self.runtime.get("last_cycle_created_ts", 0.0))
         min_interval = float(self.settings.get("passive", {}).get("passive_cooldown_sec", 2))
+        recycle_until = float(self.runtime.get("cycle_recycle_cooldown_until", 0.0))
+        if now < recycle_until:
+            self.runtime["last_execution_block_reason"] = "RECYCLE_COOLDOWN"
+            return None
         if now - last_created < min_interval:
             self.runtime["last_execution_block_reason"] = "CYCLE_CREATE_COOLDOWN"
             return None
@@ -1348,7 +1424,8 @@ class LUCTerminal(QMainWindow):
                 lines.append(
                     f"{cycle_id} | {cycle.get('mode', '-')} | CYCLE | {cycle.get('entry_side', '-')}/{cycle.get('exit_side', '-')} | "
                     f"{cycle.get('entry_price', 0.0):.8f}->{cycle.get('exit_price', 0.0):.8f} | {cycle.get('qty', 0.0):.8f} | {state} | - | "
-                    f"{cycle.get('entry_order_id', '-')}/{cycle.get('exit_order_id', '-')}"
+                    f"{cycle.get('entry_order_id', '-')}/{cycle.get('exit_order_id', '-')} | cancel={cycle.get('last_cancel_reason', '-')} "
+                    f"| reprice={cycle.get('last_reprice_reason', '-')} | quality={cycle.get('trap_quality', '-')}"
                 )
             self.active_orders_view.setPlainText("\n".join(lines) if lines else "No active orders.")
             if prev_count != len(orders):
@@ -1445,6 +1522,8 @@ class LUCTerminal(QMainWindow):
                         self._refresh_balances_only()
                     elif entry_status in {"NEW", "PARTIALLY_FILLED"}:
                         fair_gap_ticks = self.runtime.get("fair_gap_ticks")
+                        spread_ticks = self.runtime.get("spread_ticks")
+                        euri = self.runtime.get("euri", {})
                         gap_gone = False
                         if cycle.get("mode") == "BUY_TRAP" and fair_gap_ticks is not None and fair_gap_ticks < trap_min_gap_ticks:
                             gap_gone = True
@@ -1456,11 +1535,16 @@ class LUCTerminal(QMainWindow):
                                 _promote_partial_to_exit(cycle_id, cycle, entry, min(orig_qty, executed_qty))
                             else:
                                 cycle["state"] = "CANCELED"
+                                cycle["last_cancel_reason"] = "gap_gone"
                             cycle["updated_ts"] = time.time()
                             self._append_log("[CYCLE] entry cancel gap_gone")
+                            self.runtime["cycle_recycle_cooldown_until"] = time.time() + float(trap_cfg.get("trap_recycle_cooldown_sec", 7))
                             self._refresh_open_orders()
                             self._refresh_balances_only()
                             continue
+                        if cycle.get("mode") in {"BUY_TRAP", "SELL_TRAP"}:
+                            quality = self._trap_quality(cycle.get("mode"), fair_gap_ticks, spread_ticks, trap_min_gap_ticks)
+                            cycle["trap_quality"] = quality
                         if age_sec > max_lifetime:
                             self._append_log(f"[CYCLE] entry stale age={age_sec:.1f}s")
                             if executed_qty > 0:
@@ -1472,21 +1556,24 @@ class LUCTerminal(QMainWindow):
                             else:
                                 self.client.cancel_order("EURIUSDT", int(entry_order_id))
                                 cycle["state"] = "CANCELED"
+                                cycle["last_cancel_reason"] = "stale"
+                                self.runtime["last_stale_cancel"] = {"mode": cycle.get("mode"), "side": cycle.get("entry_side"), "price": cycle.get("entry_price"), "reason": "stale", "ts": time.time()}
                                 cycle["updated_ts"] = time.time()
                                 self._append_log("[CYCLE] entry canceled stale")
+                            self.runtime["cycle_recycle_cooldown_until"] = time.time() + float(trap_cfg.get("trap_recycle_cooldown_sec", 7))
                             self._refresh_open_orders()
                             self._refresh_balances_only()
                             continue
                         if cycle.get("mode") in {"BUY_TRAP", "SELL_TRAP"}:
                             last_reprice = float(cycle.get("last_reprice_ts", 0.0))
                             if time.time() - last_reprice >= trap_cooldown_sec:
-                                euri = self.runtime.get("euri", {})
-                                if cycle.get("mode") == "BUY_TRAP":
-                                    new_price = float(euri.get("ask", 0.0) or 0.0)
-                                else:
-                                    new_price = float(euri.get("bid", 0.0) or 0.0)
+                                new_price = self._trap_entry_price(cycle.get("mode"), euri, tick=tick_size, spread_ticks=spread_ticks, fair_gap_ticks=fair_gap_ticks)
                                 old_price = float(cycle.get("entry_price", 0.0) or 0.0)
-                                if new_price > 0 and old_price > 0 and abs(new_price - old_price) >= tick_size:
+                                if cycle.get("mode") == "BUY_TRAP" and float(euri.get("ask", 0.0) or 0.0) <= old_price:
+                                    cycle["last_reprice_reason"] = "better_price"
+                                elif cycle.get("mode") == "BUY_TRAP" and spread_ticks is not None and spread_ticks >= 1 and new_price is not None and abs(new_price - old_price) >= tick_size:
+                                    cycle["last_reprice_reason"] = "book_shift"
+                                if new_price is not None and new_price > 0 and old_price > 0 and abs(new_price - old_price) >= tick_size:
                                     self.client.cancel_order("EURIUSDT", int(entry_order_id))
                                     if executed_qty > 0:
                                         _promote_partial_to_exit(cycle_id, cycle, entry, min(orig_qty, executed_qty))
@@ -1503,7 +1590,8 @@ class LUCTerminal(QMainWindow):
                                     cycle["last_reprice_ts"] = time.time()
                                     cycle["updated_ts"] = time.time()
                                     self.runtime.setdefault("order_to_cycle", {})[str(new_order_id)] = cycle_id
-                                    self._append_log(f"[CYCLE] entry reprice old={old_price:.8f} new={new_price:.8f}")
+                                    reason = cycle.get("last_reprice_reason", "better_price")
+                                    self._append_log(f"[CYCLE] entry reprice old={old_price:.8f} new={new_price:.8f} reason={reason}")
                                     self._refresh_open_orders()
                                     self._refresh_balances_only()
                 elif state == "EXIT_PENDING":
